@@ -5,18 +5,9 @@ CMakeCache.txt
 cmake_install.cmake
 Makefile
 
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-# Build
-build/
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
+# Generated assembly (regenerate with ./scripts/gen_asm.sh)
+asm/
+*.s
 
 # IDE
 .vscode/

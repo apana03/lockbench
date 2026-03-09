@@ -7,10 +7,10 @@ struct ttas_lock {
 
   void lock() noexcept {
     for (;;) {
-      // First: spin-read (shared state) to reduce RMW traffic.
+      // spin on reads first so we don't spam expensive atomic writes
       while (state.load(std::memory_order_relaxed)) cpu_relax();
 
-      // Then: try to acquire with an exchange (RMW).
+      // now try to actually grab it
       if (!state.exchange(true, std::memory_order_acquire)) return;
     }
   }

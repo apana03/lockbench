@@ -13,7 +13,7 @@
   inline void cpu_relax() noexcept { std::this_thread::yield(); }
 #endif
 
-//Simple spin barrier: all threads wait until "go" is set.
+// spin barrier - threads wait here until everyone is ready
 struct start_barrier {
   std::atomic<int> arrived{0};
   std::atomic<bool> go{false};
@@ -35,7 +35,7 @@ struct start_barrier {
   }
 };
 
-// Busy-wait for approximately `ns` (kept deterministic & no syscalls).
+// spin for roughly ns nanoseconds (used to simulate work in critical sections)
 inline void busy_wait_ns(std::uint64_t ns) {
   auto start = std::chrono::steady_clock::now();
   while (true) {
