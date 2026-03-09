@@ -4,7 +4,6 @@
 #include <random>
 
 // Zipfian distribution - generates skewed random values
-// theta close to 0 is basically uniform, 0.99 is very skewed (most YCSB benchmarks use this)
 class zipfian_generator {
 public:
   zipfian_generator(std::uint64_t n, double theta, std::uint64_t seed = 42)

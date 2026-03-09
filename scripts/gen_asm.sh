@@ -31,12 +31,27 @@ for fn in tas_lock ttas_lock ttas_unlock cas_lock cas_unlock \
   # match the mangled name pattern
   pattern="${fn}_fn"
   outfile="$OUT_DIR/${fn}.s"
-  # extract from label to next label or end, strip assembler directives
+  # extract from the target label to the next top-level symbol label, while
+  # keeping local block labels like LBB... inside the function body.
   awk -v pat="$pattern" '
     BEGIN { found=0 }
-    $0 ~ pat && $0 ~ /:/ { found=1 }
-    found && /^_[^_]/ && $0 !~ pat { found=0 }
-    found { print }
+    {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+
+      if (line ~ /^[.$_[:alpha:]][.$_[:alnum:]]*:/) {
+        label = line
+        sub(/:.*/, "", label)
+
+        if (!found) {
+          if (index(label, pat)) found=1
+        } else if (!index(label, pat) && label !~ /^\.?L/) {
+          exit
+        }
+      }
+
+      if (found) print
+    }
   ' "$OUT_DIR/lock_asm.s" | grep -v '^\s*\.' | grep -v '^\s*;' | grep -v '^$' > "$outfile" 2>/dev/null || true
 
   if [ -s "$outfile" ]; then
