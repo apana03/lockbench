@@ -3,7 +3,6 @@
 #include <cstdint>
 #include "util.hpp"
 
-// Ticket lock - works like a deli counter: grab a number, wait for yours
 // Two counters on separate cache lines so they don't interfere
 struct ticket_lock {
   alignas(64) std::atomic<std::uint32_t> next{0};

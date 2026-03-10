@@ -24,7 +24,6 @@ struct epoch_rcu {
 
   explicit epoch_rcu(int n) : slots(n), max_threads(n) {}
 
-  // reader enters - just announce our epoch
   std::uint64_t read_lock(int tid) noexcept {
     std::uint64_t e = global_epoch.load(std::memory_order_acquire);
     slots[tid].epoch.store(e, std::memory_order_release);

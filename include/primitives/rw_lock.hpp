@@ -40,7 +40,6 @@ struct rw_lock {
     state.store(0, std::memory_order_release);
   }
 
-  // so we can use it in the same benchmarks as the other locks
   void lock() noexcept { write_lock(); }
   void unlock() noexcept { write_unlock(); }
 };

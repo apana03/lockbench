@@ -152,4 +152,4 @@ EXPERIMENT.md        detailed results and analysis
 
 ## Results
 
-See [EXPERIMENT.md](EXPERIMENT.md) for detailed benchmark results, assembly analysis, and recommendations.
+See [EXPERIMENT.md](EXPERIMENT.md) for detailed benchmark results and assembly analysis.

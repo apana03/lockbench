@@ -15,3 +15,6 @@ asm/
 
 # OS
 .DS_Store
+
+# Local Claude Code instructions (never push)
+CLAUDE.md

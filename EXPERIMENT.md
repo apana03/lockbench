@@ -32,7 +32,7 @@ The primitives studied are:
 
 ### Methodology
 
-- **Warmup**: 1–2 seconds before measurement (excluded from results).
+- **Warmup**: 1 second before measurement (excluded from results).
 - **Measurement**: 3 seconds per configuration; reported as total ops and ns/op.
 - **Fairness**: Ratio of min to max per-thread operation count (1.0 = perfect).
 - Each thread runs a tight loop performing operations until a shared `stop` flag is
@@ -58,105 +58,98 @@ Threads contend on a **single shared lock** with no critical section work (cs_ns
 
 | Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads |
 |------|-------------------|-----------|-----------|-----------|
-| TAS | **1,413** | 112 | 40 | 8.2 |
-| TTAS | 1,372 | 171 | **76** | **26** |
-| CAS | 988 | **195** | 76 | 26 |
-| Ticket | 708 | 38 | 22 | 9.0 |
-| RW (write) | 998 | 176 | 51 | 9.1 |
-| OCC (write) | 363 | 136 | 59 | 9.4 |
+| TAS | **1,424** | 115 | 39.7 | 8.5 |
+| TTAS | 1,370 | 173 | **75.9** | **23.0** |
+| CAS | 983 | **192** | 75.3 | 23.7 |
+| Ticket | 709 | 26.5 | 13.1 | 5.6 |
+| RW (write) | 1,049 | 145 | 45.5 | 8.9 |
+| OCC (write) | 356 | 121 | 58.3 | 10.4 |
 
 #### Observations
 
-- **TAS** is fastest single-threaded (1.4 GHz). On Apple M3 Pro with ARMv8.1
-  LSE, `test_and_set` compiles to a single `swpab` (atomic swap byte with
-  acquire) (see Section 3.7 for the full assembly). However, it scales poorly
-  because every spin iteration issues an RMW, causing cache-line bouncing.
-- **TTAS and CAS** are near-identical multi-threaded. The spin-read phase
-  (`ldrb` plain load) keeps RMW traffic low — only issuing `swpab`/`casab`
-  when the lock looks free. TTAS slightly wins at 1 thread because `swpab`
-  is simpler than `casab` (no comparison step).
-- **Ticket lock** is 2–3× slower in throughput but provides **near-perfect
-  fairness** (ratio ≥ 0.999 at all thread counts). The `lock()` path touches
-  two separate cache lines (`ldadd` on `next`, then `ldapur` on `owner` at
-  offset +64), and the FIFO spin prevents lock stealing.
-- **RW and OCC** in exclusive mode have overhead from their more complex state
-  encoding (`casa` on a 32/64-bit word vs. byte-sized flag operations).
+- **TAS**  degrades rapidly
+  under contention because every spin iteration issues an RMW, bouncing the cache line
+  between cores (8 threads: 8.5 Mops/s, **167× drop**).
+- **TTAS and CAS** are nearly identical multi-threaded. Their spin-read phase (`ldrb`)
+  keeps the line in shared state, issuing the RMW only when the lock appears free.
+  TTAS is slightly faster single-threaded since `swpab` is simpler than `casab`.
+- **Ticket lock** is 2–5× lower throughput but achieves **near-perfect fairness**
+  (ratio ≥ 0.999). Its `lock()` touches two cache lines (`ldadd` on `next`,
+  `ldapur` on `owner` at +64B), and FIFO ordering prevents lock stealing.
+- **RW and OCC** in exclusive mode have higher overhead from wider atomics
+  (`casa` on 32/64-bit words vs. byte-sized operations).
 
 #### Fairness (4 threads, cs_ns=0)
 
 | Lock | Min ops | Max ops | Ratio |
 |------|---------|---------|-------|
-| TAS | 29.6M | 30.2M | 0.982 |
-| TTAS | 48.2M | 64.1M | 0.752 |
-| CAS | 46.5M | 68.7M | 0.676 |
-| Ticket | 16.6M | 16.6M | **1.000** |
-| RW | 36.2M | 39.6M | 0.916 |
-| OCC | 39.7M | 48.9M | 0.813 |
+| TAS | 29.0M | 30.7M | 0.945 |
+| TTAS | 53.6M | 67.0M | 0.800 |
+| CAS | 47.5M | 63.0M | 0.755 |
+| Ticket | 9.9M | 9.9M | **1.000** |
+| RW | 30.8M | 33.5M | 0.920 |
+| OCC | 37.6M | 50.3M | 0.747 |
 
-**Key insight**: TTAS/CAS achieve higher throughput by being *unfair*. A thread
-that just released the lock is likely to reacquire it immediately (cache-line is
-hot in its L1). Ticket lock prevents this but pays a throughput penalty.
+TTAS/CAS achieve higher throughput by being unfair: a thread that just released
+the lock reacquires it before others see the release (hot L1 cache line). Ticket
+lock enforces FIFO at the cost of ~83% lower throughput.
 
 ---
 
-### 3.2 Critical Section Cost Sweep (lockbench, 4 threads)
-
-How do locks behave as the work inside the critical section grows?
+### 3.2 Critical Section Cost Sweep (4 threads)
 
 | cs_ns | TAS (ns/op) | TTAS | CAS | Ticket |
 |-------|-------------|------|-----|--------|
-| 0 | 25 | 13 | 13 | 45 |
-| 50 | 93 | 92 | 92 | 116 |
-| 100 | 124 | 114 | 114 | 141 |
-| 500 | 433 | 407 | 407 | 432 |
-| 1,000 | 810 | 783 | 783 | 809 |
-| 5,000 | 3,814 | 3,786 | 3,786 | 3,822 |
+| 0 | 25 | 13 | 13 | 75 |
+| 50 | 96 | 96 | 95 | 117 |
+| 100 | 136 | 115 | 116 | 142 |
+| 500 | 435 | 408 | 408 | 432 |
+| 1,000 | 810 | 783 | 784 | 812 |
+| 5,000 | 3,817 | 3,788 | 3,789 | 3,830 |
 
-As cs_ns grows, lock overhead becomes negligible — all primitives converge
-because the bottleneck shifts from lock acquisition to the critical section work.
-At cs_ns=500+ the choice of lock barely matters for throughput.
+All locks converge by cs_ns=500. The bottleneck shifts to the critical section,
+and lock overhead becomes negligible. The choice of lock only matters under
+low-cs workloads.
 
-**However, fairness diverges dramatically.** At cs_ns=100:
+**Fairness diverges significantly at cs_ns=100:**
 
 | Lock | Min thread ops | Max thread ops | Ratio |
-|------|---------------|----------------|-------|
-| TAS | 5.90M | 6.18M | 0.955 |
-| TTAS | **1** | 10.0M | **~0** |
-| CAS | 1.13M | 9.95M | 0.114 |
-| Ticket | 5.33M | 5.33M | **1.000** |
+|------|----------------|----------------|-------|
+| TAS | 5.4M | 5.6M | 0.955 |
+| TTAS | 4.5M | 10.6M | 0.428 |
+| CAS | 4.0M | 7.7M | 0.521 |
+| Ticket | 5.3M | 5.3M | **1.000** |
 
-TTAS under load with meaningful critical sections can **completely starve threads**.
-One thread reacquires the lock before others even see it released. Ticket lock
-maintains perfect fairness regardless of critical section length.
+With a meaningful critical section, TTAS and CAS show severe starvation. The releasing thread keeps the line hot in its L1 and reacquires before waiters can observe the release. 
 
 ---
 
-### 3.3 Reader-Writer Workloads (lockbench, RW and OCC)
+### 3.3 Reader-Writer Workloads (RW and OCC)
 
 | Lock | Read % | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads |
 |------|--------|-------------------|-----------|-----------|-----------|
-| RW | 50% | 82 | 26 | 12 | 4.5 |
-| RW | 80% | 141 | 33 | 15 | 4.6 |
-| RW | 95% | 174 | 37 | 18 | 4.6 |
-| OCC | 50% | 78 | 28 | 14 | 4.0 |
-| OCC | 80% | 135 | 46 | **36** | **8.8** |
-| OCC | 95% | 132 | **81** | **82** | **51** |
-| RCU | 50% | 46 | 16 | 10 | 3.4 |
-| RCU | 80% | 73 | 29 | 20 | 7.0 |
-| RCU | 95% | 151 | 76 | 77 | 24 |
+| RW | 50% | 78 | 25 | 12 | 4.3 |
+| RW | 80% | 105 | 32 | 15 | 4.3 |
+| RW | 95% | 125 | 29 | 18 | 4.2 |
+| OCC | 50% | 75 | 26 | 14 | 4.0 |
+| OCC | 80% | 104 | 43 | **35** | **10.3** |
+| OCC | 95% | 169 | **76** | **78** | **36** |
+| RCU | 50% | 55 | 16 | 11 | 3.7 |
+| RCU | 80% | 84 | 32 | 20 | 7.1 |
+| RCU | 95% | 118 | 87 | 76 | 24 |
 
 #### Observations
 
 - **RW lock does not scale with read percentage.** At 8 threads, throughput is
-  ~4.6 Mops/s regardless of read ratio. The `fetch_sub` in `read_unlock()` still
-  bounces the cache line, and the CAS in `read_lock()` serializes under contention.
-- **OCC scales dramatically at high read ratios.** At 95% reads, 4 threads:
-  OCC delivers 82 Mops/s vs. RW's 18 Mops/s (**4.6×**). Optimistic reads
-  involve only loads — no cache-line invalidation. This is the key advantage
-  for read-heavy indexes.
-- **RCU** provides good read scaling (77 Mops/s at 95% reads, 4 threads) but
-  the write-side `synchronize()` is expensive — it must drain all reader epochs.
-  RCU is best when writes are very rare.
+  ~4.2–4.3 Mops/s regardless of read ratio. Each `read_lock` issues a `casa` RMW
+  and each `read_unlock` issues `ldaddl` — two cache-line invalidations per read.
+  Readers serialize on the same cache line as writers.
+- **OCC scales dramatically at high read ratios.** At 95% reads, 4 threads: OCC
+  delivers 78 Mops/s vs. RW's 18 Mops/s (**4.3×**). Optimistic reads are pure
+  loads (`ldapr` + `dmb ishld` + `ldr`) — no RMW, no cache-line invalidation.
+- **RCU** provides strong read scaling at 95% (76 Mops/s at 4T, matching OCC),
+  but the write-side `synchronize()` must drain all reader epochs => expensive for
+  write-heavy workloads.
 
 ---
 
@@ -169,83 +162,78 @@ maintains perfect fairness regardless of critical section length.
 
 | Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads | Speedup (1→8) |
 |------|-------------------|-----------|-----------|-----------|---------------|
-| TAS | 46.0 | 95.7 | 192.8 | **228.6** | **4.97×** |
-| TTAS | 47.9 | 95.0 | 193.5 | 228.1 | 4.76× |
-| CAS | 46.9 | 93.3 | 190.5 | 225.7 | 4.81× |
-| Ticket | 28.6 | 57.6 | 113.8 | 161.4 | 5.64× |
-| RW | 46.0 | 91.4 | 188.5 | 219.2 | 4.77× |
-| OCC | 37.0 | 74.9 | 154.4 | 217.2 | 5.87× |
+| TAS | 30.7 | 63.2 | 121.8 | **146.0** | 4.75× |
+| TTAS | 29.7 | 59.0 | 121.6 | 143.0 | 4.81× |
+| CAS | 27.4 | 58.2 | 118.9 | 145.6 | 5.31× |
+| Ticket | 21.3 | 43.2 | 85.8 | 117.0 | 5.49× |
+| RW | 27.5 | 58.6 | 118.0 | 143.5 | 5.22× |
+| OCC | 24.6 | 52.9 | 105.1 | 144.1 | **5.86×** |
 
 #### Analysis
 
-- **TAS, TTAS, CAS** are nearly indistinguishable in the index context. With
-  65K buckets and uniform keys, contention per bucket is negligible, so the
-  spin-read optimization of TTAS/CAS provides no benefit. Lock overhead is
-  dwarfed by hash computation + bucket traversal (~18–21 ns/op single-threaded).
-- **All three achieve near-linear scaling** to 4 threads (4.1×) and good scaling
-  to 8 threads (4.8–5.0×). The 11-core M3 Pro has limited bandwidth for 8
-  threads of index operations.
-- **Ticket lock has 1.6× higher per-operation overhead** single-threaded (35 ns
-  vs. 21 ns) due to the two-counter protocol. But its scaling ratio is actually
-  better (5.64×) because the FIFO ordering prevents cache-line pingponging.
-- **OCC** has the highest single-threaded overhead (27 ns — version
-  read+validate), but the **best scaling** (5.87×). At 8 threads, it nearly
-  catches up to TAS/TTAS because optimistic reads don't invalidate the bucket's
-  cache line.
-- **RW lock** with per-bucket shared reads performs well but doesn't beat the
-  simple spinlocks — the CAS cost in `read_lock()`/`read_unlock()` is comparable
-  to exclusive acquire/release at this contention level.
+- **TAS, TTAS, CAS** are nearly indistinguishable. With 65K buckets and uniform keys,
+  per-bucket contention is negligible, so the spin-read optimization of TTAS/CAS
+  provides no benefit. Lock overhead (~3–5 ns) is dwarfed by hash computation and
+  bucket traversal (~30–40 ns/op single-threaded).
+- **All three scale nearly linearly** to 4 threads (~4×) and well to 8 threads
+  (~4.7–5.3×).
+- **Ticket lock** has ~1.4× higher per-op overhead single-threaded (the two-counter
+  protocol). Its scaling ratio (5.49×) is better than TAS (4.75×) because FIFO
+  ordering reduces cache-line pingponging at higher thread counts.
+- **OCC** has the highest single-threaded overhead (version read + validate) but the
+  best scaling (5.86×). Optimistic reads don't invalidate the bucket's cache line,
+  which helps at 8 threads even with uniform access.
+- **RW lock** performs comparably to TAS/TTAS — the CAS cost in `read_lock()`
+  eliminates the theoretical benefit of shared reads at this contention level.
 
 #### Zipfian Key Distribution (θ=0.99, high contention on hot buckets)
 
 | Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads | Speedup (1→8) |
 |------|-------------------|-----------|-----------|-----------|---------------|
-| TAS | 32.2 | 60.3 | 112.8 | 122.3 | 3.80× |
-| TTAS | 32.4 | 60.7 | 113.3 | 127.4 | 3.93× |
-| CAS | 31.7 | 59.8 | 112.5 | 125.9 | 3.97× |
-| Ticket | 28.4 | 52.6 | 96.3 | 107.8 | 3.80× |
-| RW | 31.1 | 58.5 | 110.6 | 123.7 | 3.98× |
-| OCC | 30.7 | 59.6 | **115.2** | **154.0** | **5.02×** |
+| TAS | 24.5 | 48.5 | 88.8 | 100.7 | 4.11× |
+| TTAS | 24.3 | 42.5 | 78.8 | 81.5 | 3.36× |
+| CAS | 18.7 | 43.2 | 67.4 | 71.9 | 3.84× |
+| Ticket | 17.1 | 38.4 | 74.4 | 87.9 | 5.14× |
+| RW | 21.8 | 43.1 | 83.8 | 99.5 | 4.56× |
+| OCC | 20.6 | 39.3 | **86.3** | **117.3** | **5.69×** |
 
-**OCC wins decisively under Zipfian.** At 8 threads, OCC achieves 154 Mops/s
-vs. TTAS's 127 Mops/s (**1.21×**). Hot buckets are accessed mostly for reads
-(80%), and OCC's optimistic reads avoid cache-line invalidation on those
-contested buckets. This is the exact access pattern of real-world indexes (e.g.,
-B-tree root and upper-level nodes are hot but rarely written).
+**OCC wins decisively under Zipfian.** At 8 threads, OCC achieves 117 Mops/s vs.
+TAS's 101 Mops/s (**1.16×**). Hot buckets are accessed mostly for reads (80%), and
+OCC's optimistic reads avoid cache-line invalidation on contested buckets — the exact
+access pattern of B-tree root and upper-level nodes.
 
-**Ticket lock** still provides the best fairness but at lower throughput. Under
-Zipfian, its gap narrows because all locks suffer from hot-bucket serialization.
+Under skew, TTAS/CAS scaling degrades more than TAS (3.4× vs. 4.1×): spin-read
+threads spinning on hot lock bytes still add coherence traffic on the hot bucket's
+cache line.
 
 ---
 
 ### 3.5 Contention Density (indexbench, 4 threads, uniform)
 
-Varying bucket count controls how many keys map to each bucket (contention density).
+Varying bucket count controls contention density (keys/bucket).
 
 | Buckets | Keys/Bucket | TTAS (Mops/s) | CAS | Ticket | OCC |
 |---------|-------------|---------------|-----|--------|-----|
-| 64 | 15,625 | 0.54 | 0.34 | 0.46 | 0.55 |
-| 256 | 3,906 | 1.56 | 1.59 | 1.85 | 1.71 |
-| 1,024 | 977 | 5.13 | 3.57 | 5.04 | 5.73 |
-| 4,096 | 244 | 19.7 | 13.8 | 15.4 | 16.4 |
-| 16,384 | 61 | 66.4 | 44.9 | 46.3 | 58.5 |
-| 65,536 | 15 | **159.2** | 133.1 | 92.7 | 139.4 |
-| 262,144 | 4 | 127.9 | **143.5** | 104.9 | 135.9 |
+| 64 | 15,625 | 0.41 | 0.40 | 0.41 | 0.37 |
+| 256 | 3,906 | 1.34 | 1.36 | 1.28 | 1.34 |
+| 1,024 | 977 | 3.87 | 4.05 | 4.01 | 3.53 |
+| 4,096 | 244 | 13.8 | 16.2 | 14.5 | 13.8 |
+| 16,384 | 61 | 49.6 | 48.0 | 41.2 | 44.8 |
+| 65,536 | 15 | **98.2** | 98.2 | 71.2 | 85.1 |
+| 262,144 | 4 | **130.5** | 117.0 | 95.9 | 114.5 |
 
 #### Analysis
 
-- At **high contention** (64–1024 buckets), all locks converge because threads
-  spend most of their time waiting. Critical section length (bucket traversal
-  with thousands of entries) dominates lock overhead.
-- At **medium contention** (4K–16K buckets), TTAS pulls ahead due to its
-  efficient spin-read phase. OCC is competitive here.
-- At **low contention** (65K+ buckets), the picture changes: TTAS peaks at 65K
-  buckets then drops at 262K. This is a **cache capacity effect** — 262K buckets
-  × 128+ bytes/bucket exceeds L2 cache, causing misses on bucket access. CAS
-  actually wins at 262K buckets, likely because its slightly different memory
-  access pattern interacts better with the prefetcher.
-- **Ticket lock** scales linearly with decreasing contention but never reaches
-  the peak throughput of TTAS/CAS due to its inherent two-cache-line protocol.
+- At **high contention** (64–1,024 buckets), all locks converge — threads spend most
+  time waiting while traversing long bucket chains (thousands of entries per bucket).
+  Lock algorithm choice is irrelevant here.
+- At **medium contention** (4K–16K buckets), CAS slightly leads; the difference
+  is within run-to-run variance.
+- At **low contention** (65K+ buckets), TTAS consistently leads. Throughput continues
+  growing through 262K buckets (130.5 Mops/s) — the working set (262K × 128+ bytes ≈
+  32 MB) begins exceeding L2 but prefetching still helps TTAS's sequential spin-read.
+- **Ticket lock** scales with decreasing contention but never reaches TTAS/CAS peak
+  throughput due to the two-cache-line acquire protocol.
 
 ---
 
@@ -258,110 +246,96 @@ Reads scan 16 consecutive elements; writes update one element.
 
 | Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads | Speedup (1→8) |
 |------|-------------------|-----------|-----------|-----------|---------------|
-| TAS | 71.7 | 37.9 | 19.8 | 4.6 | 0.06× |
-| TTAS | 70.1 | 50.4 | 28.8 | 8.7 | 0.12× |
-| CAS | 65.1 | 49.3 | 25.2 | 8.1 | 0.12× |
-| Ticket | 67.6 | 18.4 | 10.9 | 5.3 | 0.08× |
-| RW | 62.3 | 40.7 | 20.8 | 5.7 | 0.09× |
-| OCC | **65.3** | **83.3** | **60.9** | **17.5** | **0.27×** |
+| TAS | 62.8 | 32.9 | 17.4 | 4.5 | 0.07× |
+| TTAS | 61.7 | 45.3 | 27.8 | 8.5 | 0.14× |
+| CAS | 61.9 | 45.7 | 25.7 | 8.2 | 0.13× |
+| Ticket | 58.3 | 18.3 | 11.8 | 5.9 | 0.10× |
+| RW | 61.2 | 38.5 | 21.5 | 5.5 | 0.09× |
+| OCC | **62.2** | **79.6** | **61.8** | **17.1** | **0.27×** |
 
 #### Observations
 
-- **All exclusive locks show negative scaling** with a single global lock. This is
-  expected: the entire array is one critical section, so threads serialize completely.
-  Adding threads only adds contention overhead.
-- **OCC is the only primitive that scales beyond 1 thread.** At 2 threads, OCC
-  achieves 83.3 Mops/s vs. its own 65.3 Mops/s single-threaded (1.28×). At 4
-  threads it reaches 60.9 Mops/s — still close to single-threaded. This is because
-  80% of operations are optimistic reads that don't acquire any lock at all.
-- **TTAS and CAS** are the best exclusive spinlocks, following the same pattern as
-  the raw lock benchmarks. Their spin-read phase reduces cache-line bouncing.
-- **Ticket lock** pays a heavy penalty under high contention (18.4 Mops/s at 2
-  threads vs. TTAS's 50.4 Mops/s) but maintains near-perfect fairness (ratio ≥ 0.999).
-- **RW lock** performs worse than TTAS/CAS despite supporting shared reads. The CAS
-  overhead in `read_lock()` on a single contended cache line negates the benefit.
+- **All exclusive locks scale negatively** with a single global lock — threads
+  serialize completely and adding threads only increases contention overhead.
+- **OCC is the only primitive that scales beyond 1 thread ** because 80% of operations are lock-free optimistic reads.
+- **TTAS and CAS** are the best exclusive spinlocks, consistent with the raw
+  lock benchmarks. Their spin-read phase reduces cache-line bouncing under contention.
+- **Ticket lock** drops sharply at 2 threads (18.3 vs. TTAS's 45.3 Mops/s) due to
+  the `ldadd` on `next` bouncing under high contention, but maintains perfect fairness.
+- **RW lock** performs worse than TTAS/CAS despite supporting shared reads: the
+  `casa` RMW in `read_lock()` serializes readers on the same contended cache line.
 
-#### Single Lock — 95% Read (Read-Heavy)
+#### Single Lock — 95% Read 
 
 | Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads |
 |------|-------------------|-----------|-----------|-----------|
-| TAS | 74.5 | 39.0 | 19.4 | 5.3 |
-| TTAS | 74.1 | 53.0 | 34.6 | 9.4 |
-| CAS | 74.0 | 54.2 | 31.2 | 8.9 |
-| Ticket | 74.1 | 20.2 | 13.7 | 6.4 |
-| RW | 72.6 | 45.4 | 27.7 | 5.8 |
-| OCC | 73.8 | **121.5** | **155.1** | **82.1** |
+| TAS | 65.8 | 33.6 | 18.0 | 5.0 |
+| TTAS | 64.1 | 46.0 | 30.0 | 9.3 |
+| CAS | 64.1 | 47.0 | 27.5 | 8.8 |
+| Ticket | 64.2 | 17.4 | 11.9 | 5.9 |
+| RW | 62.7 | 37.4 | 24.7 | 5.7 |
+| OCC | 64.7 | **106.9** | **136.3** | **80.0** |
 
 **OCC dominates at high read ratios.** At 4 threads with 95% reads, OCC delivers
-155 Mops/s — more than **double** its single-threaded throughput and **4.5× faster**
-than the next best lock (TTAS at 34.6 Mops/s). With only 5% writes, optimistic read
-validation almost never fails, so readers execute fully in parallel.
+136 Mops/s (2.1× its own single-threaded rate and 4.5× faster than TTAS
+(30.0 Mops/s)). With only 5% writes, validation almost never fails, so readers execute
+fully in parallel with zero cache-line invalidations.
 
-All exclusive locks remain below their single-threaded performance regardless of read
-percentage, because every operation (read or write) acquires the global lock.
-
-#### Single Lock — 50% Read (Write-Heavy)
+#### Single Lock — 50% Read
 
 | Lock | 1 thread (Mops/s) | 4 threads | 8 threads |
 |------|-------------------|-----------|-----------|
-| TAS | 63.7 | 13.7 | 4.2 |
-| TTAS | 62.8 | 22.5 | 8.0 |
-| CAS | 64.1 | 19.9 | 7.2 |
-| Ticket | 63.7 | 11.1 | 5.9 |
-| RW | 63.7 | 19.5 | 5.1 |
-| OCC | 63.2 | 27.2 | 6.8 |
+| TAS | 62.2 | 15.8 | 4.2 |
+| TTAS | 62.1 | 25.6 | 8.2 |
+| CAS | 62.4 | 23.7 | 7.2 |
+| Ticket | 62.0 | 11.8 | 5.8 |
+| RW | 62.0 | 18.9 | 5.0 |
+| OCC | 60.7 | 25.8 | 7.2 |
 
-Under heavy writes, OCC's advantage shrinks because optimistic reads frequently fail
-validation (50% of concurrent operations are writes). At 8 threads, TTAS slightly
-edges OCC (8.0 vs. 6.8 Mops/s) — failed optimistic reads must retry, adding wasted
-work. The lesson: **OCC only helps when the read-to-write ratio is high.**
+At 50% writes, OCC's advantage largely disappears, frequent writes cause optimistic
+reads to fail validation and retry. 
 
 #### Striped Locks (64 Stripes) — 80% Read
 
-64 independent locks, each protecting a 1,024-element stripe. Contention per stripe
-is 64× lower than the single-lock case.
+64 independent locks, each protecting a 1,024-element stripe.
 
 | Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads | Speedup (1→8) |
 |------|-------------------|-----------|-----------|-----------|---------------|
-| TAS | 62.1 | 99.5 | 159.8 | 117.4 | 1.89× |
-| TTAS | 61.3 | 98.7 | 159.2 | 118.2 | 1.93× |
-| CAS | 59.6 | 87.7 | 148.4 | 91.1 | 1.53× |
-| Ticket | 49.0 | 76.4 | 115.3 | 95.9 | 1.96× |
-| RW | 58.1 | 92.1 | 143.3 | 118.6 | 2.04× |
-| OCC | 51.5 | 90.7 | 154.9 | 114.2 | 2.22× |
+| TAS | 54.0 | 87.6 | **145.1** | 104.7 | 1.94× |
+| TTAS | 54.4 | 86.4 | **145.0** | 105.9 | 1.95× |
+| CAS | 53.8 | 86.1 | 142.3 | 105.2 | 1.95× |
+| Ticket | 53.5 | 72.9 | 111.9 | 97.2 | 1.82× |
+| RW | 52.4 | 79.2 | 142.4 | 104.0 | 1.98× |
+| OCC | 53.5 | 84.3 | 140.6 | 102.7 | 1.92× |
 
 #### Observations
 
-- **Striped locks restore positive scaling.** All locks now scale to at least 4
-  threads, confirming that partitioned contention is the primary enabler of
-  parallelism — not the lock algorithm.
-- **All locks peak at 4 threads** and plateau or regress at 8 threads. This is a
-  **memory bandwidth bottleneck**: 8 threads scanning array elements saturate the
-  memory subsystem (65K × 8 bytes = 512 KB, fitting in L2 but with 8 threads
-  competing for L2/L3 bandwidth).
-- **TAS and TTAS** lead at 4 threads (~160 Mops/s) with near-identical performance.
-  At this contention level (uniform access over 64 stripes with 4 threads), stripe
-  collisions are rare, so the spin-read optimization of TTAS provides no advantage.
-- **OCC's advantage disappears** compared to the single-lock case. With 64 stripes,
-  exclusive lock contention is already low, so the optimistic read path's benefit
-  is marginal. OCC's extra version-read overhead actually makes it slightly slower
-  than TAS/TTAS in the striped configuration.
-- **Ticket lock** has the lowest single-threaded throughput (49 Mops/s vs. 62 Mops/s
-  for TAS) due to its two-counter protocol, but achieves the best scaling ratio
-  alongside OCC, consistent with its FIFO fairness preventing cache-line thrashing.
+- **Striped locks restore positive scaling for all primitives.** This confirms that
+  contention partitioning is the primary enabler of parallelism, not the lock
+  algorithm itself.
+- **All locks peak at 4 threads** and regress at 8. With 8 threads scanning the
+  512 KB array (65K × 8 bytes) => memory bandwidth not lock contention becomes
+  the bottleneck.
+- **TAS, TTAS, and CAS** lead at 4 threads (~145 Mops/s) with near-identical results.
+  At low per-stripe contention, TTAS's spin-read phase provides no advantage.
+- **OCC's advantage disappears** in the striped case, exclusive lock contention is
+  already low, so the optimistic read path's benefit is marginal and version-check
+  overhead slightly hurts.
+- **Ticket lock** has slightly lower peak (112 Mops/s at 4T) but the best 8-thread
+  relative performance (97.2 vs. ~104 Mops/s for TAS/TTAS), consistent with its FIFO
+  ordering reducing cache-line thrashing at higher thread counts.
 
-#### Key Insight: Single Lock vs. Striped
+#### Single Lock vs. Striped
 
 | Lock | Single 4T (Mops/s) | Striped 4T (Mops/s) | Improvement |
 |------|--------------------|--------------------|-------------|
-| TTAS | 28.8 | 159.2 | **5.5×** |
-| OCC | 60.9 | 154.9 | 2.5× |
-| Ticket | 10.9 | 115.3 | **10.6×** |
+| TTAS | 27.8 | 145.0 | **5.2×** |
+| OCC | 61.8 | 140.6 | 2.3× |
+| Ticket | 11.8 | 111.9 | **9.5×** |
 
-Partitioning contention via striping provides **5–10× improvement** for exclusive
-locks. OCC benefits less from striping because it already avoids contention on the
-read path. This reinforces the conclusion from Section 3.5: **reducing contention
-density matters more than optimizing the lock implementation.**
+Striping provides **5–10× improvement** for exclusive locks. OCC benefits less because
+it already avoids read-path contention. Reducing contention density matters more than
+optimizing the lock algorithm.
 
 ---
 
@@ -394,12 +368,11 @@ acquired:
     ret
 ```
 
-TAS is the simplest lock: 3 instructions on the fast path (mov + swpab + tbz).
-The problem is the spin loop — every iteration does a `swpab`, which is an RMW
+3 instructions on the fast path (mov + swpab + tbz).
+Every iteration does a `swpab`, which is an RMW
 that takes exclusive ownership of the cache line. Under contention, every core
 is hammering the same line with store operations, causing it to bounce between
-L1 caches (MOESI protocol transitions). This is why TAS throughput drops from
-1,413 Mops/s at 1 thread to just 8.2 Mops/s at 8 threads.
+L1 caches (MOESI protocol transitions).
 
 #### TTAS Lock
 
@@ -425,8 +398,7 @@ The key difference from TAS: the spin loop uses `ldrb` (plain load byte) instead
 of `swpab`. A plain load can be served from the local L1 cache in shared state
 without invalidating other cores' copies. Only when the lock appears free does
 the thread issue the expensive `swpab`. This dramatically reduces coherence
-traffic under contention — the benchmarks show TTAS sustaining 26 Mops/s at 8
-threads vs. TAS's 8.2 Mops/s (3.2× better).
+traffic under contention.
 
 #### CAS Lock
 
@@ -457,7 +429,7 @@ spin_read:
 CAS has the same spin-read optimization as TTAS but uses `casab` (compare-and-swap
 byte, acquire) instead of `swpab`. The extra `mov w9, #0` to reload the expected
 value before each CAS attempt explains why CAS is slightly slower than TTAS
-single-threaded (988 vs. 1,372 Mops/s) — `casab` needs both an expected and
+single-threaded (983 vs. 1,370 Mops/s) — `casab` needs both an expected and
 desired value, while `swpab` only needs the desired value. Under contention they
 converge because the spin-read loop dominates.
 
@@ -485,19 +457,19 @@ acquired:
     ret
 ```
 
-Two things stand out. First, `lock()` accesses **two different cache lines**: `ldadd`
+`lock()` accesses two different cache lines `ldadd`
 on `next` at `[x0]` and `ldapur` on `owner` at `[x0, #64]`. The `alignas(64)` in the
 C++ code ensures these counters live on separate 64-byte cache lines, avoiding false
 sharing between the ticket dispenser and the "now serving" display.
 
-Second, the spin loop only reads `owner` (`ldapur`) — it never writes. Only the
+Second, the spin loop only reads `owner` (`ldapur`), it never writes. Only the
 unlock path writes to `owner`, and since exactly one thread holds the lock, there
-is only **one writer** to the owner cache line at any time. This is why the spin
+is only one writer to the owner cache line at any time. This is why the spin
 loop generates less coherence traffic than TAS. However, the `ldadd` on `next`
 during lock acquisition is an RMW that bounces under heavy contention, which is
 why ticket lock is still slower than TTAS overall.
 
-The unlock uses `stlur` (store-release with unscaled offset) — a non-atomic store
+The unlock uses `stlur` (store-release with unscaled offset), a non-atomic store
 is safe here because only the lock holder writes to `owner`.
 
 #### RW Lock
@@ -544,20 +516,14 @@ acquired:
 
 The RW lock assembly reveals **why it underperforms OCC for reads**:
 
-- `read_lock` requires a `casa` (CAS word, acquire) — a full RMW operation that
-  takes exclusive ownership of the cache line. Even though multiple readers can
-  hold the lock concurrently, each `read_lock` call **invalidates the cache line
-  for all other cores** while the CAS executes. Under contention, readers
-  serialize on the CAS.
-- `read_unlock` uses `ldaddl` (atomic fetch_add with release) — another RMW.
-  So a complete read-side critical section requires **two RMW operations**
-  (`casa` + `ldaddl`), each causing a cache-line invalidation.
-- `write_lock` does NOT use a spin-read optimization — it issues `casa` on every
-  retry in the spin loop. This makes the writer path even more expensive under
-  contention compared to TTAS/CAS.
-
-This is 4 instructions of atomic overhead per read operation, compared to OCC's
-zero atomics on the read path (see below).
+- `read_lock` requires a `casa` (CAS word, acquire) — a full RMW that takes exclusive
+  ownership of the cache line. Even though multiple readers can hold the lock
+  concurrently, each `read_lock` call **invalidates the cache line for all other cores**.
+  Under contention, readers serialize on the CAS.
+- `read_unlock` uses `ldaddl` (atomic fetch_add with release) — another RMW. A
+  complete read-side critical section requires **two RMW operations** (`casa` + `ldaddl`).
+- `write_lock` issues `casa` on every spin iteration (no TTAS-style spin-read),
+  making the writer path more expensive under contention than TTAS/CAS.
 
 #### OCC (Seqlock)
 
@@ -601,21 +567,18 @@ spin:
 ```
 
 **This is why OCC dominates read-heavy workloads.** The entire read path consists of:
-- `read_begin`: one `ldapr` (load-acquire) — a plain load with acquire semantics.
-  On ARM, `ldapr` does not invalidate the cache line and can be served from shared
-  L1 cache state. **No RMW, no cache-line bouncing.**
-- `read_validate`: one `dmb ishld` (load fence) + one `ldr` (plain load) + compare.
-  Again, **no RMW operations**. The `dmb ishld` is a lightweight load-only barrier
-  that prevents the CPU from reordering the preceding data reads past the version
-  check.
+- `read_begin`: one `ldapr` (load-acquire). On ARM, `ldapr` does not invalidate the
+  cache line and is served from shared L1 state. **No RMW, no cache-line bouncing.**
+- `read_validate`: one `dmb ishld` (load-only fence) + one `ldr` (plain load) + compare.
+  **Zero RMW operations.** The `dmb ishld` prevents the CPU from reordering data reads
+  past the version check.
 
-Compare this to the RW lock's read path: `casa` (RMW) + `ldaddl` (RMW) = two
-cache-line invalidations per read. OCC's read path causes **zero invalidations**,
-which is why at 95% reads and 4 threads, OCC achieves 155 Mops/s vs. RW's 27.7
-Mops/s (5.6×) on the array benchmark.
+Compare to the RW lock: `casa` (RMW) + `ldaddl` (RMW) = two cache-line invalidations
+per read. OCC causes **zero invalidations**, which is why at 95% reads and 4 threads,
+OCC achieves 136 Mops/s vs. RW's 24.7 Mops/s (**5.5×**) on the array benchmark.
 
-The tradeoff: if a writer was active during the read, validation fails and the
-reader must retry. This only matters when writes are frequent (50%+ write ratio).
+The tradeoff: validation fails if a writer was active during the read, requiring a
+retry. This overhead is measurable once writes exceed ~20–30% of operations.
 
 #### Instruction Count Summary
 
@@ -628,67 +591,31 @@ reader must retry. This only matters when writes are frequent (50%+ write ratio)
 | RW | read: 7 insns (with `casa`), unlock: `ldaddl` | write: `stlr` | **2 RMW** (`casa` + `ldaddl`) |
 | OCC | read: `ldapr` + `tbz`, validate: `dmb` + `ldr` + `cmp` + `cset` | write: `ldaddl` | **0 RMW** |
 
-#### Key Observations from Assembly
-
-1. **ARM LSE eliminates LL/SC overhead.** On older ARM cores without LSE,
-   `atomic_flag::test_and_set` would compile to an `ldxrb`/`stxrb` loop (4+
-   instructions, with spurious failures from the exclusive monitor). With LSE,
-   it becomes a single `swpab`. This is why all our locks are quite fast even
-   single-threaded — the M3 Pro's LSE implementation is very efficient.
-
-2. **The TTAS optimization is visible in assembly.** TAS spins with `swpab`
-   (RMW every iteration), while TTAS spins with `ldrb` (plain load) and only
-   issues `swpab` when the lock looks free. CAS does the same with `ldrb` +
-   `casab`. This is the source of the 3× throughput difference at 8 threads.
-
-3. **All unlocks are trivial.** TAS/TTAS/CAS use `stlrb` (store-release byte),
-   RW write uses `stlr` (store-release word), ticket uses `stlur` (store-release
-   with offset). These are simple stores with release semantics — no RMW needed
-   because the lock holder is the only writer.
-
-4. **OCC's read path is uniquely cheap.** `ldapr` + `dmb ishld` + `ldr` — all
-   loads, no stores, no RMW. This is fundamentally different from every other
-   lock where even reading requires modifying shared state. This matches the
-   benchmark results where OCC scales linearly with readers while all other
-   locks plateau.
-
-5. **Ticket lock's two-cache-line design is visible.** `[x0]` for `next` and
-   `[x0, #64]` for `owner` — the 64-byte offset directly corresponds to the
-   `alignas(64)` in the C++ struct. This prevents false sharing but means
-   `lock()` touches two cache lines instead of one.
-
-6. **RW write_lock lacks spin-read optimization.** It issues `casa` on every
-   spin iteration (like TAS's `swpab`), while OCC's `write_lock` uses a
-   TTAS-style `ldr` + `tbnz` spin before the CAS. This makes RW write
-   acquisition more expensive under contention.
-
 ---
 
 ### Key Takeaways
 
 1. **Lock overhead is negligible when contention is low.** With 65K+ buckets and
-   uniform access, the lock acquire/release adds ~2–5 ns to a ~20 ns operation.
-   The choice of lock matters far less than the data structure design (bucket
-   count, node size, cache locality).
+   uniform access, the lock acquire/release adds ~3–5 ns to a ~30–40 ns operation.
+   Data structure design (bucket count, node size, cache locality) matters far more
+   than the lock choice.
 
-2. **Under skew, OCC wins.** Zipfian workloads concentrate accesses on a few hot
-   buckets/nodes. OCC readers don't invalidate the cache line, enabling true
-   read parallelism. This matches the structure of B-trees (hot root/internal
-   nodes, cold leaves).
+2. **Under skew, OCC wins.** Zipfian workloads concentrate accesses on hot
+   buckets/nodes. OCC readers don't invalidate the cache line, enabling true read
+   parallelism — the exact access pattern of B-tree root and upper-level nodes.
 
 3. **Fairness and throughput are in tension.** TTAS/CAS achieve high throughput by
-   being unfair (recent releasers reacquire faster). Ticket lock guarantees FIFO
-   but sacrifices 30–40% throughput. Choose based on whether tail latency or
-   aggregate throughput matters more.
+   being unfair (recent releasers reacquire faster), but can starve threads when
+   critical sections are non-trivial (min/max ratio ≈ 0.4 at cs_ns=100). Ticket lock
+   guarantees FIFO order at ~40–80% throughput cost, depending on contention level.
 
-4. **RW locks disappoint in practice.** The theoretical advantage of shared read
-   access is offset by the CAS overhead in `read_lock()`/`read_unlock()`. OCC
-   achieves the same goal more efficiently by avoiding atomics on the read path
-   entirely.
+4. **RW locks disappoint in practice.** The theoretical advantage of shared reads
+   is negated by the CAS in `read_lock()`/`read_unlock()`. OCC achieves the same
+   goal with zero read-path atomics.
 
-5. **Contention density is the dominant factor.** Designing the index for low
-   contention (more fine-grained nodes, higher fanout, lock striping) provides
-   more benefit than optimizing the lock implementation.
+5. **Contention density is the dominant factor.** Lock striping (Section 3.6) yields
+   5–10× improvement for exclusive locks. Choosing the right data structure granularity
+   provides more benefit than optimizing the lock algorithm.
 
 ---
 
