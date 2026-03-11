@@ -6,11 +6,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+#include <sys/stat.h>
 
 #include "../include/primitives/util.hpp"
 #include "../include/primitives/tas_lock.hpp"
@@ -27,8 +30,9 @@ struct params {
   int  threads          = std::max(1u, std::thread::hardware_concurrency());
   int  seconds          = 3;
   int  warmup_seconds   = 1;
-  std::uint64_t cs_ns   = 0;         // synthetic work inside critical section
+  std::uint64_t cs_work = 0;         // busy_work iterations inside critical section
   int  read_pct         = 80;        // read percentage for rw / rcu workloads
+  std::string csv_file;              // optional CSV output path
 };
 
 static void usage() {
@@ -41,8 +45,9 @@ static void usage() {
     "  --threads  <N>    Number of worker threads [default: hw_concurrency]\n"
     "  --seconds  <S>    Measurement duration in seconds [default: 3]\n"
     "  --warmup   <S>    Warmup duration in seconds [default: 1]\n"
-    "  --cs_ns    <NS>   Busy-wait nanoseconds inside critical section [default: 0]\n"
-    "  --read_pct <P>    Read percentage for rw/rcu workloads (0-100) [default: 80]\n";
+    "  --cs_work  <N>    Busy-work loop iterations inside critical section [default: 0]\n"
+    "  --read_pct <P>    Read percentage for rw/rcu workloads (0-100) [default: 80]\n"
+    "  --csv      <file> Append results as CSV to file\n";
 }
 
 static params parse_args(int argc, char** argv) {
@@ -59,8 +64,9 @@ static params parse_args(int argc, char** argv) {
     else if (a == "--threads")  p.threads   = std::stoi(need("--threads"));
     else if (a == "--seconds")  p.seconds   = std::stoi(need("--seconds"));
     else if (a == "--warmup")   p.warmup_seconds = std::stoi(need("--warmup"));
-    else if (a == "--cs_ns")    p.cs_ns     = std::stoull(need("--cs_ns"));
+    else if (a == "--cs_work")  p.cs_work   = std::stoull(need("--cs_work"));
     else if (a == "--read_pct") p.read_pct  = std::stoi(need("--read_pct"));
+    else if (a == "--csv")      p.csv_file  = need("--csv");
     else if (a == "--help" || a == "-h") { usage(); std::exit(0); }
     else { std::cerr << "Unknown arg: " << a << "\n"; std::exit(2); }
   }
@@ -75,7 +81,7 @@ struct bench_result {
   const char* lock_label;
   const char* workload_label;
   int threads;
-  std::uint64_t cs_ns;
+  std::uint64_t cs_work;
   int read_pct;
   double secs;
   std::uint64_t total_ops;
@@ -84,7 +90,18 @@ struct bench_result {
   std::vector<std::uint64_t> per_thread;
 };
 
-static void print_result(const bench_result& r) {
+static void csv_append(const std::string& path, const std::string& header,
+                       const std::string& row) {
+  bool write_header = false;
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0 || st.st_size == 0)
+    write_header = true;
+  std::ofstream f(path, std::ios::app);
+  if (write_header) f << header << "\n";
+  f << row << "\n";
+}
+
+static void print_result(const bench_result& r, const std::string& csv_file) {
   double ops_s = static_cast<double>(r.total_ops) / r.secs;
   double ns_op = (r.secs * 1e9) / std::max<std::uint64_t>(1, r.total_ops);
 
@@ -92,7 +109,7 @@ static void print_result(const bench_result& r) {
     << "lock=" << r.lock_label
     << " workload=" << r.workload_label
     << " threads=" << r.threads
-    << " cs_ns=" << r.cs_ns
+    << " cs_work=" << r.cs_work
     << " read_pct=" << r.read_pct
     << " seconds=" << r.secs
     << " total_ops=" << r.total_ops
@@ -102,14 +119,27 @@ static void print_result(const bench_result& r) {
     << " ns_op=" << ns_op
     << "\n";
 
+  std::uint64_t mn = 0, mx = 0;
+  double fairness = 1.0;
   if (r.threads > 1) {
-    std::uint64_t mn = *std::min_element(r.per_thread.begin(), r.per_thread.end());
-    std::uint64_t mx = *std::max_element(r.per_thread.begin(), r.per_thread.end());
+    mn = *std::min_element(r.per_thread.begin(), r.per_thread.end());
+    mx = *std::max_element(r.per_thread.begin(), r.per_thread.end());
     double avg = static_cast<double>(r.total_ops) / r.threads;
-    double fairness = (mx > 0) ? static_cast<double>(mn) / static_cast<double>(mx) : 1.0;
+    fairness = (mx > 0) ? static_cast<double>(mn) / static_cast<double>(mx) : 1.0;
     std::cout
       << "  fairness: min=" << mn << " max=" << mx
       << " avg=" << avg << " ratio=" << fairness << "\n";
+  }
+
+  if (!csv_file.empty()) {
+    std::string header = "lock,workload,threads,cs_work,read_pct,seconds,total_ops,read_ops,write_ops,ops_s,ns_op,fairness_min,fairness_max,fairness_ratio";
+    std::ostringstream row;
+    row << r.lock_label << "," << r.workload_label << "," << r.threads << ","
+        << r.cs_work << "," << r.read_pct << "," << r.secs << ","
+        << r.total_ops << "," << r.read_ops << "," << r.write_ops << ","
+        << static_cast<std::uint64_t>(ops_s) << "," << ns_op << ","
+        << mn << "," << mx << "," << fairness;
+    csv_append(csv_file, header, row.str());
   }
 }
 
@@ -118,6 +148,7 @@ template <class Lock>
 static void bench_mutex(const params& p, const char* label) {
   Lock lock;
   std::atomic<bool> stop{false};
+  std::atomic<bool> measuring{false};
   start_barrier barrier(p.threads);
 
   std::vector<std::uint64_t> counts(p.threads, 0);
@@ -130,9 +161,9 @@ static void bench_mutex(const params& p, const char* label) {
       std::uint64_t local = 0;
       while (!stop.load(std::memory_order_relaxed)) {
         lock.lock();
-        if (p.cs_ns) busy_wait_ns(p.cs_ns);
+        if (p.cs_work) busy_work(p.cs_work);
         lock.unlock();
-        ++local;
+        if (measuring.load(std::memory_order_relaxed)) ++local;
       }
       counts[t] = local;
     });
@@ -144,8 +175,7 @@ static void bench_mutex(const params& p, const char* label) {
   if (p.warmup_seconds > 0)
     std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
 
-  for (auto& c : counts) c = 0;
-
+  measuring.store(true, std::memory_order_relaxed);
   auto t0 = std::chrono::steady_clock::now();
   std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
   stop.store(true, std::memory_order_relaxed);
@@ -156,14 +186,15 @@ static void bench_mutex(const params& p, const char* label) {
   std::uint64_t total = 0;
   for (auto c : counts) total += c;
 
-  print_result({label, "mutex", p.threads, p.cs_ns, 100, secs,
-                total, 0, total, counts});
+  print_result({label, "mutex", p.threads, p.cs_work, 100, secs,
+                total, 0, total, counts}, p.csv_file);
 }
 
 // rw lock benchmark - readers and writers on a shared counter
 static void bench_rw(const params& p, const char* label) {
   rw_lock lock;
   std::atomic<bool> stop{false};
+  std::atomic<bool> measuring{false};
   start_barrier barrier(p.threads);
 
   alignas(64) std::uint64_t shared_data = 0;
@@ -182,16 +213,16 @@ static void bench_rw(const params& p, const char* label) {
       while (!stop.load(std::memory_order_relaxed)) {
         if (dist(rng) < p.read_pct) {
           lock.read_lock();
-          if (p.cs_ns) busy_wait_ns(p.cs_ns);
+          if (p.cs_work) busy_work(p.cs_work);
           volatile std::uint64_t sink = shared_data; (void)sink;
           lock.read_unlock();
-          ++stats[t].reads;
+          if (measuring.load(std::memory_order_relaxed)) ++stats[t].reads;
         } else {
           lock.write_lock();
-          if (p.cs_ns) busy_wait_ns(p.cs_ns);
+          if (p.cs_work) busy_work(p.cs_work);
           ++shared_data;
           lock.write_unlock();
-          ++stats[t].writes;
+          if (measuring.load(std::memory_order_relaxed)) ++stats[t].writes;
         }
       }
     });
@@ -203,8 +234,7 @@ static void bench_rw(const params& p, const char* label) {
   if (p.warmup_seconds > 0)
     std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
 
-  for (auto& s : stats) { s.reads = 0; s.writes = 0; }
-
+  measuring.store(true, std::memory_order_relaxed);
   auto t0 = std::chrono::steady_clock::now();
   std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
   stop.store(true, std::memory_order_relaxed);
@@ -220,14 +250,15 @@ static void bench_rw(const params& p, const char* label) {
     per_thread[t] = stats[t].reads + stats[t].writes;
   }
 
-  print_result({label, "rw", p.threads, p.cs_ns, p.read_pct, secs,
-                total_reads + total_writes, total_reads, total_writes, per_thread});
+  print_result({label, "rw", p.threads, p.cs_work, p.read_pct, secs,
+                total_reads + total_writes, total_reads, total_writes, per_thread}, p.csv_file);
 }
 
 // same thing but with OCC - readers don't take a lock, just validate after
 static void bench_occ_rw(const params& p, const char* label) {
   occ_lock lock;
   std::atomic<bool> stop{false};
+  std::atomic<bool> measuring{false};
   start_barrier barrier(p.threads);
 
   alignas(64) std::uint64_t shared_data = 0;
@@ -249,17 +280,17 @@ static void bench_occ_rw(const params& p, const char* label) {
           do {
             auto v = lock.read_begin();
             val = shared_data;
-            if (p.cs_ns) busy_wait_ns(p.cs_ns);
+            if (p.cs_work) busy_work(p.cs_work);
             if (lock.read_validate(v)) break;
           } while (true);
           volatile std::uint64_t sink = val; (void)sink;
-          ++stats[t].reads;
+          if (measuring.load(std::memory_order_relaxed)) ++stats[t].reads;
         } else {
           lock.write_lock();
-          if (p.cs_ns) busy_wait_ns(p.cs_ns);
+          if (p.cs_work) busy_work(p.cs_work);
           ++shared_data;
           lock.write_unlock();
-          ++stats[t].writes;
+          if (measuring.load(std::memory_order_relaxed)) ++stats[t].writes;
         }
       }
     });
@@ -271,8 +302,7 @@ static void bench_occ_rw(const params& p, const char* label) {
   if (p.warmup_seconds > 0)
     std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
 
-  for (auto& s : stats) { s.reads = 0; s.writes = 0; }
-
+  measuring.store(true, std::memory_order_relaxed);
   auto t0 = std::chrono::steady_clock::now();
   std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
   stop.store(true, std::memory_order_relaxed);
@@ -288,14 +318,15 @@ static void bench_occ_rw(const params& p, const char* label) {
     per_thread[t] = stats[t].reads + stats[t].writes;
   }
 
-  print_result({label, "rw", p.threads, p.cs_ns, p.read_pct, secs,
-                total_reads + total_writes, total_reads, total_writes, per_thread});
+  print_result({label, "rw", p.threads, p.cs_work, p.read_pct, secs,
+                total_reads + total_writes, total_reads, total_writes, per_thread}, p.csv_file);
 }
 
 // RCU benchmark - readers announce their epoch, writers swap a pointer and wait
 static void bench_rcu(const params& p, const char* label) {
   epoch_rcu rcu(p.threads);
   std::atomic<bool> stop{false};
+  std::atomic<bool> measuring{false};
   start_barrier barrier(p.threads);
 
   alignas(64) std::atomic<std::uint64_t*> data_ptr{new std::uint64_t(0)};
@@ -319,9 +350,9 @@ static void bench_rcu(const params& p, const char* label) {
           rcu.read_lock(t);
           std::uint64_t* ptr = data_ptr.load(std::memory_order_acquire);
           volatile std::uint64_t sink = *ptr; (void)sink;
-          if (p.cs_ns) busy_wait_ns(p.cs_ns);
+          if (p.cs_work) busy_work(p.cs_work);
           rcu.read_unlock(t);
-          ++stats[t].reads;
+          if (measuring.load(std::memory_order_relaxed)) ++stats[t].reads;
         } else {
           writer_lock.lock();
           std::uint64_t* old = data_ptr.load(std::memory_order_relaxed);
@@ -329,9 +360,9 @@ static void bench_rcu(const params& p, const char* label) {
           data_ptr.store(fresh, std::memory_order_release);
           rcu.synchronize();
           delete old;
-          if (p.cs_ns) busy_wait_ns(p.cs_ns);
+          if (p.cs_work) busy_work(p.cs_work);
           writer_lock.unlock();
-          ++stats[t].writes;
+          if (measuring.load(std::memory_order_relaxed)) ++stats[t].writes;
         }
       }
     });
@@ -343,8 +374,7 @@ static void bench_rcu(const params& p, const char* label) {
   if (p.warmup_seconds > 0)
     std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
 
-  for (auto& s : stats) { s.reads = 0; s.writes = 0; }
-
+  measuring.store(true, std::memory_order_relaxed);
   auto t0 = std::chrono::steady_clock::now();
   std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
   stop.store(true, std::memory_order_relaxed);
@@ -362,8 +392,8 @@ static void bench_rcu(const params& p, const char* label) {
     per_thread[t] = stats[t].reads + stats[t].writes;
   }
 
-  print_result({label, "rcu", p.threads, p.cs_ns, p.read_pct, secs,
-                total_reads + total_writes, total_reads, total_writes, per_thread});
+  print_result({label, "rcu", p.threads, p.cs_work, p.read_pct, secs,
+                total_reads + total_writes, total_reads, total_writes, per_thread}, p.csv_file);
 }
 
 int main(int argc, char** argv) {

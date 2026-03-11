@@ -6,11 +6,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+#include <sys/stat.h>
 
 #include "../include/primitives/util.hpp"
 #include "../include/primitives/tas_lock.hpp"
@@ -34,6 +37,7 @@ struct params {
   std::size_t num_buckets = 1 << 16;   // 65536 buckets
   std::uint64_t key_range = 1'000'000; // key space [0, key_range)
   std::size_t prefill     = 500'000;   // pre-populate before benchmark
+  std::string csv_file;
 };
 
 static void usage() {
@@ -51,7 +55,8 @@ static void usage() {
     "  --zipf_theta <T>    Zipfian skew (0.0-0.99) [default: 0.99]\n"
     "  --buckets <N>       Hash table buckets (power of 2) [default: 65536]\n"
     "  --key_range <N>     Key space size [default: 1000000]\n"
-    "  --prefill <N>       Keys to pre-insert [default: 500000]\n";
+    "  --prefill <N>       Keys to pre-insert [default: 500000]\n"
+    "  --csv <file>        Append results as CSV to file\n";
 }
 
 static params parse_args(int argc, char** argv) {
@@ -73,6 +78,7 @@ static params parse_args(int argc, char** argv) {
     else if (a == "--buckets")    p.num_buckets   = std::stoull(need("--buckets"));
     else if (a == "--key_range")  p.key_range     = std::stoull(need("--key_range"));
     else if (a == "--prefill")    p.prefill       = std::stoull(need("--prefill"));
+    else if (a == "--csv")        p.csv_file      = need("--csv");
     else if (a == "--help" || a == "-h") { usage(); std::exit(0); }
     else { std::cerr << "Unknown arg: " << a << "\n"; std::exit(2); }
   }
@@ -90,108 +96,23 @@ struct alignas(64) thread_stats {
   std::uint64_t removes = 0;
 };
 
-template <class Lock>
-static void run_index_bench(const params& p, const char* label) {
-  hash_index<Lock> index(p.num_buckets);
+static void csv_append(const std::string& path, const std::string& header,
+                       const std::string& row) {
+  bool write_header = false;
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0 || st.st_size == 0)
+    write_header = true;
+  std::ofstream f(path, std::ios::app);
+  if (write_header) f << header << "\n";
+  f << row << "\n";
+}
 
-  // fill in some data first so reads/deletes actually find stuff
-  {
-    std::mt19937_64 rng(12345);
-    std::uniform_int_distribution<std::uint64_t> key_dist(0, p.key_range - 1);
-    for (std::size_t i = 0; i < p.prefill; ++i) {
-      std::uint64_t k = key_dist(rng);
-      index.put(k, k + 1);
-    }
-  }
-
-  std::atomic<bool> stop{false};
-  start_barrier barrier(p.threads);
-
-  std::vector<thread_stats> stats(p.threads);
-  std::vector<std::thread> workers;
-  workers.reserve(p.threads);
-
+static void print_result(const char* label, const params& p, double secs,
+                          std::uint64_t total_gets, std::uint64_t total_puts,
+                          std::uint64_t total_rems,
+                          const std::vector<std::uint64_t>& per_thread) {
   int delete_pct = 100 - p.read_pct - p.insert_pct;
-
-  for (int t = 0; t < p.threads; ++t) {
-    workers.emplace_back([&, t] {
-      barrier.arrive_and_wait();
-
-      std::uint64_t local_gets = 0, local_puts = 0, local_rems = 0;
-
-      if (p.dist == "zipfian") {
-        zipfian_generator gen(p.key_range, p.zipf_theta, t + 100);
-        std::mt19937 op_rng(t + 200);
-        std::uniform_int_distribution<int> op_dist(0, 99);
-
-        while (!stop.load(std::memory_order_relaxed)) {
-          std::uint64_t key = gen.next_scrambled();
-          int op = op_dist(op_rng);
-          if (op < p.read_pct) {
-            index.get(key);
-            ++local_gets;
-          } else if (op < p.read_pct + p.insert_pct) {
-            index.put(key, key + 1);
-            ++local_puts;
-          } else {
-            index.remove(key);
-            ++local_rems;
-          }
-        }
-      } else {
-        std::mt19937_64 key_rng(t + 100);
-        std::uniform_int_distribution<std::uint64_t> key_dist(0, p.key_range - 1);
-        std::mt19937 op_rng(t + 200);
-        std::uniform_int_distribution<int> op_dist(0, 99);
-
-        while (!stop.load(std::memory_order_relaxed)) {
-          std::uint64_t key = key_dist(key_rng);
-          int op = op_dist(op_rng);
-          if (op < p.read_pct) {
-            index.get(key);
-            ++local_gets;
-          } else if (op < p.read_pct + p.insert_pct) {
-            index.put(key, key + 1);
-            ++local_puts;
-          } else {
-            index.remove(key);
-            ++local_rems;
-          }
-        }
-      }
-
-      stats[t].gets    = local_gets;
-      stats[t].puts    = local_puts;
-      stats[t].removes = local_rems;
-    });
-  }
-
-  barrier.wait_all_arrived();
-  barrier.release();
-
-  if (p.warmup_seconds > 0) {
-    std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
-    for (auto& s : stats) { s.gets = 0; s.puts = 0; s.removes = 0; }
-  }
-
-  auto t0 = std::chrono::steady_clock::now();
-  std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
-  stop.store(true, std::memory_order_relaxed);
-  for (auto& th : workers) th.join();
-  auto t1 = std::chrono::steady_clock::now();
-
-  double secs = std::chrono::duration<double>(t1 - t0).count();
-
-  std::uint64_t total_gets = 0, total_puts = 0, total_rems = 0;
-  std::vector<std::uint64_t> per_thread(p.threads);
-  for (int t = 0; t < p.threads; ++t) {
-    total_gets += stats[t].gets;
-    total_puts += stats[t].puts;
-    total_rems += stats[t].removes;
-    per_thread[t] = stats[t].gets + stats[t].puts + stats[t].removes;
-  }
   std::uint64_t total = total_gets + total_puts + total_rems;
-
   double ops_s = static_cast<double>(total) / secs;
   double ns_op = (secs * 1e9) / std::max<std::uint64_t>(1, total);
 
@@ -213,14 +134,141 @@ static void run_index_bench(const params& p, const char* label) {
     << " ns_op=" << ns_op
     << "\n";
 
+  std::uint64_t mn = 0, mx = 0;
+  double fairness = 1.0;
   if (p.threads > 1) {
-    std::uint64_t mn = *std::min_element(per_thread.begin(), per_thread.end());
-    std::uint64_t mx = *std::max_element(per_thread.begin(), per_thread.end());
-    double fairness = (mx > 0) ? static_cast<double>(mn) / static_cast<double>(mx) : 1.0;
+    mn = *std::min_element(per_thread.begin(), per_thread.end());
+    mx = *std::max_element(per_thread.begin(), per_thread.end());
+    fairness = (mx > 0) ? static_cast<double>(mn) / static_cast<double>(mx) : 1.0;
     std::cout
       << "  fairness: min=" << mn << " max=" << mx
       << " ratio=" << fairness << "\n";
   }
+
+  if (!p.csv_file.empty()) {
+    std::string header = "lock,dist,threads,buckets,key_range,read_pct,insert_pct,delete_pct,seconds,total_ops,gets,puts,removes,ops_s,ns_op,fairness_min,fairness_max,fairness_ratio";
+    std::ostringstream row;
+    row << label << "," << p.dist << "," << p.threads << ","
+        << p.num_buckets << "," << p.key_range << "," << p.read_pct << ","
+        << p.insert_pct << "," << delete_pct << "," << secs << ","
+        << total << "," << total_gets << "," << total_puts << ","
+        << total_rems << "," << static_cast<std::uint64_t>(ops_s) << ","
+        << ns_op << "," << mn << "," << mx << "," << fairness;
+    csv_append(p.csv_file, header, row.str());
+  }
+}
+
+// shared benchmark driver: prefill, run workers, measure, print
+// get_fn(index, key) is called for reads, put_fn(index, key) for inserts
+template <class Index>
+static void run_bench_common(const params& p, const char* label, Index& index,
+                              auto get_fn, auto put_fn, auto remove_fn) {
+  std::atomic<bool> stop{false};
+  std::atomic<bool> measuring{false};
+  start_barrier barrier(p.threads);
+
+  std::vector<thread_stats> stats(p.threads);
+  std::vector<std::thread> workers;
+  workers.reserve(p.threads);
+
+  for (int t = 0; t < p.threads; ++t) {
+    workers.emplace_back([&, t] {
+      barrier.arrive_and_wait();
+
+      std::uint64_t local_gets = 0, local_puts = 0, local_rems = 0;
+
+      if (p.dist == "zipfian") {
+        zipfian_generator gen(p.key_range, p.zipf_theta, t + 100);
+        std::mt19937 op_rng(t + 200);
+        std::uniform_int_distribution<int> op_dist(0, 99);
+
+        while (!stop.load(std::memory_order_relaxed)) {
+          std::uint64_t key = gen.next_scrambled();
+          int op = op_dist(op_rng);
+          if (op < p.read_pct) {
+            get_fn(index, key);
+            if (measuring.load(std::memory_order_relaxed)) ++local_gets;
+          } else if (op < p.read_pct + p.insert_pct) {
+            put_fn(index, key);
+            if (measuring.load(std::memory_order_relaxed)) ++local_puts;
+          } else {
+            remove_fn(index, key);
+            if (measuring.load(std::memory_order_relaxed)) ++local_rems;
+          }
+        }
+      } else {
+        std::mt19937_64 key_rng(t + 100);
+        std::uniform_int_distribution<std::uint64_t> key_dist(0, p.key_range - 1);
+        std::mt19937 op_rng(t + 200);
+        std::uniform_int_distribution<int> op_dist(0, 99);
+
+        while (!stop.load(std::memory_order_relaxed)) {
+          std::uint64_t key = key_dist(key_rng);
+          int op = op_dist(op_rng);
+          if (op < p.read_pct) {
+            get_fn(index, key);
+            if (measuring.load(std::memory_order_relaxed)) ++local_gets;
+          } else if (op < p.read_pct + p.insert_pct) {
+            put_fn(index, key);
+            if (measuring.load(std::memory_order_relaxed)) ++local_puts;
+          } else {
+            remove_fn(index, key);
+            if (measuring.load(std::memory_order_relaxed)) ++local_rems;
+          }
+        }
+      }
+
+      stats[t].gets    = local_gets;
+      stats[t].puts    = local_puts;
+      stats[t].removes = local_rems;
+    });
+  }
+
+  barrier.wait_all_arrived();
+  barrier.release();
+
+  if (p.warmup_seconds > 0)
+    std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
+
+  measuring.store(true, std::memory_order_relaxed);
+  auto t0 = std::chrono::steady_clock::now();
+  std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
+  stop.store(true, std::memory_order_relaxed);
+  for (auto& th : workers) th.join();
+  auto t1 = std::chrono::steady_clock::now();
+
+  double secs = std::chrono::duration<double>(t1 - t0).count();
+
+  std::uint64_t total_gets = 0, total_puts = 0, total_rems = 0;
+  std::vector<std::uint64_t> per_thread(p.threads);
+  for (int t = 0; t < p.threads; ++t) {
+    total_gets += stats[t].gets;
+    total_puts += stats[t].puts;
+    total_rems += stats[t].removes;
+    per_thread[t] = stats[t].gets + stats[t].puts + stats[t].removes;
+  }
+
+  print_result(label, p, secs, total_gets, total_puts, total_rems, per_thread);
+}
+
+template <class Lock>
+static void run_index_bench(const params& p, const char* label) {
+  hash_index<Lock> index(p.num_buckets);
+
+  // fill in some data first so reads/deletes actually find stuff
+  {
+    std::mt19937_64 rng(12345);
+    std::uniform_int_distribution<std::uint64_t> key_dist(0, p.key_range - 1);
+    for (std::size_t i = 0; i < p.prefill; ++i) {
+      std::uint64_t k = key_dist(rng);
+      index.put(k, k + 1);
+    }
+  }
+
+  run_bench_common(p, label, index,
+    [](auto& idx, std::uint64_t key) { idx.get(key); },
+    [](auto& idx, std::uint64_t key) { idx.put(key, key + 1); },
+    [](auto& idx, std::uint64_t key) { idx.remove(key); });
 }
 
 // rw lock version - reads use shared lock instead of exclusive
@@ -236,117 +284,10 @@ static void run_rw_index_bench(const params& p, const char* label) {
     }
   }
 
-  std::atomic<bool> stop{false};
-  start_barrier barrier(p.threads);
-
-  std::vector<thread_stats> stats(p.threads);
-  std::vector<std::thread> workers;
-  workers.reserve(p.threads);
-
-  for (int t = 0; t < p.threads; ++t) {
-    workers.emplace_back([&, t] {
-      barrier.arrive_and_wait();
-      std::uint64_t local_gets = 0, local_puts = 0, local_rems = 0;
-
-      if (p.dist == "zipfian") {
-        zipfian_generator gen(p.key_range, p.zipf_theta, t + 100);
-        std::mt19937 op_rng(t + 200);
-        std::uniform_int_distribution<int> op_dist(0, 99);
-
-        while (!stop.load(std::memory_order_relaxed)) {
-          std::uint64_t key = gen.next_scrambled();
-          int op = op_dist(op_rng);
-          if (op < p.read_pct) {
-            index.get_shared(key);
-            ++local_gets;
-          } else if (op < p.read_pct + p.insert_pct) {
-            index.put(key, key + 1);
-            ++local_puts;
-          } else {
-            index.remove(key);
-            ++local_rems;
-          }
-        }
-      } else {
-        std::mt19937_64 key_rng(t + 100);
-        std::uniform_int_distribution<std::uint64_t> key_dist(0, p.key_range - 1);
-        std::mt19937 op_rng(t + 200);
-        std::uniform_int_distribution<int> op_dist(0, 99);
-
-        while (!stop.load(std::memory_order_relaxed)) {
-          std::uint64_t key = key_dist(key_rng);
-          int op = op_dist(op_rng);
-          if (op < p.read_pct) {
-            index.get_shared(key);
-            ++local_gets;
-          } else if (op < p.read_pct + p.insert_pct) {
-            index.put(key, key + 1);
-            ++local_puts;
-          } else {
-            index.remove(key);
-            ++local_rems;
-          }
-        }
-      }
-
-      stats[t].gets = local_gets;
-      stats[t].puts = local_puts;
-      stats[t].removes = local_rems;
-    });
-  }
-
-  barrier.wait_all_arrived();
-  barrier.release();
-
-  if (p.warmup_seconds > 0) {
-    std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
-    for (auto& s : stats) { s.gets = 0; s.puts = 0; s.removes = 0; }
-  }
-
-  auto t0 = std::chrono::steady_clock::now();
-  std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
-  stop.store(true, std::memory_order_relaxed);
-  for (auto& th : workers) th.join();
-  auto t1 = std::chrono::steady_clock::now();
-
-  double secs = std::chrono::duration<double>(t1 - t0).count();
-
-  std::uint64_t total_gets = 0, total_puts = 0, total_rems = 0;
-  std::vector<std::uint64_t> per_thread(p.threads);
-  for (int t = 0; t < p.threads; ++t) {
-    total_gets += stats[t].gets;
-    total_puts += stats[t].puts;
-    total_rems += stats[t].removes;
-    per_thread[t] = stats[t].gets + stats[t].puts + stats[t].removes;
-  }
-  std::uint64_t total = total_gets + total_puts + total_rems;
-  double ops_s = static_cast<double>(total) / secs;
-  double ns_op = (secs * 1e9) / std::max<std::uint64_t>(1, total);
-
-  std::cout
-    << "lock=" << label
-    << " dist=" << p.dist
-    << " threads=" << p.threads
-    << " buckets=" << p.num_buckets
-    << " key_range=" << p.key_range
-    << " read_pct=" << p.read_pct
-    << " insert_pct=" << p.insert_pct
-    << " delete_pct=" << (100 - p.read_pct - p.insert_pct)
-    << " seconds=" << secs
-    << " total_ops=" << total
-    << " gets=" << total_gets
-    << " puts=" << total_puts
-    << " removes=" << total_rems
-    << " ops_s=" << static_cast<std::uint64_t>(ops_s)
-    << " ns_op=" << ns_op
-    << "\n";
-
-  if (p.threads > 1) {
-    std::uint64_t mn = *std::min_element(per_thread.begin(), per_thread.end());
-    std::uint64_t mx = *std::max_element(per_thread.begin(), per_thread.end());
-    double fairness = (mx > 0) ? static_cast<double>(mn) / static_cast<double>(mx) : 1.0;
-    std::cout << "  fairness: min=" << mn << " max=" << mx << " ratio=" << fairness << "\n";
-  }
+  run_bench_common(p, label, index,
+    [](auto& idx, std::uint64_t key) { idx.get_shared(key); },
+    [](auto& idx, std::uint64_t key) { idx.put(key, key + 1); },
+    [](auto& idx, std::uint64_t key) { idx.remove(key); });
 }
 
 // OCC version - reads don't take a lock at all, just validate after
@@ -362,117 +303,10 @@ static void run_occ_index_bench(const params& p, const char* label) {
     }
   }
 
-  std::atomic<bool> stop{false};
-  start_barrier barrier(p.threads);
-
-  std::vector<thread_stats> stats(p.threads);
-  std::vector<std::thread> workers;
-  workers.reserve(p.threads);
-
-  for (int t = 0; t < p.threads; ++t) {
-    workers.emplace_back([&, t] {
-      barrier.arrive_and_wait();
-      std::uint64_t local_gets = 0, local_puts = 0, local_rems = 0;
-
-      if (p.dist == "zipfian") {
-        zipfian_generator gen(p.key_range, p.zipf_theta, t + 100);
-        std::mt19937 op_rng(t + 200);
-        std::uniform_int_distribution<int> op_dist(0, 99);
-
-        while (!stop.load(std::memory_order_relaxed)) {
-          std::uint64_t key = gen.next_scrambled();
-          int op = op_dist(op_rng);
-          if (op < p.read_pct) {
-            index.get_optimistic(key);
-            ++local_gets;
-          } else if (op < p.read_pct + p.insert_pct) {
-            index.put(key, key + 1);
-            ++local_puts;
-          } else {
-            index.remove(key);
-            ++local_rems;
-          }
-        }
-      } else {
-        std::mt19937_64 key_rng(t + 100);
-        std::uniform_int_distribution<std::uint64_t> key_dist(0, p.key_range - 1);
-        std::mt19937 op_rng(t + 200);
-        std::uniform_int_distribution<int> op_dist(0, 99);
-
-        while (!stop.load(std::memory_order_relaxed)) {
-          std::uint64_t key = key_dist(key_rng);
-          int op = op_dist(op_rng);
-          if (op < p.read_pct) {
-            index.get_optimistic(key);
-            ++local_gets;
-          } else if (op < p.read_pct + p.insert_pct) {
-            index.put(key, key + 1);
-            ++local_puts;
-          } else {
-            index.remove(key);
-            ++local_rems;
-          }
-        }
-      }
-
-      stats[t].gets = local_gets;
-      stats[t].puts = local_puts;
-      stats[t].removes = local_rems;
-    });
-  }
-
-  barrier.wait_all_arrived();
-  barrier.release();
-
-  if (p.warmup_seconds > 0) {
-    std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
-    for (auto& s : stats) { s.gets = 0; s.puts = 0; s.removes = 0; }
-  }
-
-  auto t0 = std::chrono::steady_clock::now();
-  std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
-  stop.store(true, std::memory_order_relaxed);
-  for (auto& th : workers) th.join();
-  auto t1 = std::chrono::steady_clock::now();
-
-  double secs = std::chrono::duration<double>(t1 - t0).count();
-
-  std::uint64_t total_gets = 0, total_puts = 0, total_rems = 0;
-  std::vector<std::uint64_t> per_thread(p.threads);
-  for (int t = 0; t < p.threads; ++t) {
-    total_gets += stats[t].gets;
-    total_puts += stats[t].puts;
-    total_rems += stats[t].removes;
-    per_thread[t] = stats[t].gets + stats[t].puts + stats[t].removes;
-  }
-  std::uint64_t total = total_gets + total_puts + total_rems;
-  double ops_s = static_cast<double>(total) / secs;
-  double ns_op = (secs * 1e9) / std::max<std::uint64_t>(1, total);
-
-  std::cout
-    << "lock=" << label
-    << " dist=" << p.dist
-    << " threads=" << p.threads
-    << " buckets=" << p.num_buckets
-    << " key_range=" << p.key_range
-    << " read_pct=" << p.read_pct
-    << " insert_pct=" << p.insert_pct
-    << " delete_pct=" << (100 - p.read_pct - p.insert_pct)
-    << " seconds=" << secs
-    << " total_ops=" << total
-    << " gets=" << total_gets
-    << " puts=" << total_puts
-    << " removes=" << total_rems
-    << " ops_s=" << static_cast<std::uint64_t>(ops_s)
-    << " ns_op=" << ns_op
-    << "\n";
-
-  if (p.threads > 1) {
-    std::uint64_t mn = *std::min_element(per_thread.begin(), per_thread.end());
-    std::uint64_t mx = *std::max_element(per_thread.begin(), per_thread.end());
-    double fairness = (mx > 0) ? static_cast<double>(mn) / static_cast<double>(mx) : 1.0;
-    std::cout << "  fairness: min=" << mn << " max=" << mx << " ratio=" << fairness << "\n";
-  }
+  run_bench_common(p, label, index,
+    [](auto& idx, std::uint64_t key) { idx.get_optimistic(key); },
+    [](auto& idx, std::uint64_t key) { idx.put(key, key + 1); },
+    [](auto& idx, std::uint64_t key) { idx.remove(key); });
 }
 
 int main(int argc, char** argv) {

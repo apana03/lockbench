@@ -1,6 +1,5 @@
 #pragma once
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <thread>
 
@@ -35,13 +34,10 @@ struct start_barrier {
   }
 };
 
-// spin for roughly ns nanoseconds (used to simulate work in critical sections)
-inline void busy_wait_ns(std::uint64_t ns) {
-  auto start = std::chrono::steady_clock::now();
-  while (true) {
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
-    if (static_cast<std::uint64_t>(elapsed) >= ns) break;
-    cpu_relax();
+// do 'iters' iterations of dummy work to simulate a critical section
+// compiler barrier prevents the loop from being optimized away
+inline void busy_work(std::uint64_t iters) {
+  for (std::uint64_t i = 0; i < iters; ++i) {
+    asm volatile("" ::: "memory");
   }
 }

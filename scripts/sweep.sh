@@ -9,17 +9,21 @@ set -euo pipefail
 SECONDS_PER_RUN=${1:-3}
 MAX_THREADS=${2:-$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 8)}
 BIN="./build/lockbench"
+CSV="results/lockbench.csv"
 
 if [ ! -x "$BIN" ]; then
   echo "Build first: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build"
   exit 1
 fi
 
+mkdir -p results
+rm -f "$CSV"
+
 echo "=== Mutex workload (exclusive lock/unlock) ==="
 for lock in tas ttas cas ticket rw occ; do
   for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS"); do
     [ "$t" -gt "$MAX_THREADS" ] && continue
-    $BIN --lock "$lock" --workload mutex --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1
+    $BIN --lock "$lock" --workload mutex --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --csv "$CSV"
   done
   echo ""
 done
@@ -28,7 +32,7 @@ echo "=== RW workload (reader-writer, 80% reads) ==="
 for lock in rw occ; do
   for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS"); do
     [ "$t" -gt "$MAX_THREADS" ] && continue
-    $BIN --lock "$lock" --workload rw --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --read_pct 80
+    $BIN --lock "$lock" --workload rw --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --read_pct 80 --csv "$CSV"
   done
   echo ""
 done
@@ -37,7 +41,7 @@ echo "=== RW workload (reader-writer, 95% reads) ==="
 for lock in rw occ; do
   for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS"); do
     [ "$t" -gt "$MAX_THREADS" ] && continue
-    $BIN --lock "$lock" --workload rw --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --read_pct 95
+    $BIN --lock "$lock" --workload rw --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --read_pct 95 --csv "$CSV"
   done
   echo ""
 done
@@ -45,11 +49,11 @@ done
 echo "=== RCU workload (90% reads) ==="
 for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS"); do
   [ "$t" -gt "$MAX_THREADS" ] && continue
-  $BIN --lock rcu --workload rcu --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --read_pct 90
+  $BIN --lock rcu --workload rcu --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --read_pct 90 --csv "$CSV"
 done
 
 echo ""
 echo "=== Critical section cost sweep (4 threads, TTAS) ==="
-for ns in 0 50 100 500 1000 5000; do
-  $BIN --lock ttas --workload mutex --threads 4 --seconds "$SECONDS_PER_RUN" --warmup 1 --cs_ns "$ns"
+for work in 0 50 100 500 1000 5000; do
+  $BIN --lock ttas --workload mutex --threads 4 --seconds "$SECONDS_PER_RUN" --warmup 1 --cs_work "$work" --csv "$CSV"
 done
