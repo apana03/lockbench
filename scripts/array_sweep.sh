@@ -18,7 +18,7 @@ mkdir -p results
 rm -f "$CSV"
 
 THREAD_LIST="1 2 4 8"
-for t in $(seq 16 16 "$MAX_THREADS"); do
+for t in $(seq 16 16 "$MAX_THREADS" 2>/dev/null); do
   THREAD_LIST="$THREAD_LIST $t"
 done
 

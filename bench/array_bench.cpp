@@ -24,9 +24,6 @@
 #include "../include/primitives/rw_lock.hpp"
 #include "../include/primitives/occ.hpp"
 
-// ---------------------------------------------------------------------------
-// Parameters
-// ---------------------------------------------------------------------------
 struct params {
   std::string lock_name  = "ttas";
   int    threads         = std::max(1u, std::thread::hardware_concurrency());

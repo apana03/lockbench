@@ -21,7 +21,7 @@ rm -f "$CSV"
 
 echo "=== Mutex workload (exclusive lock/unlock) ==="
 for lock in tas ttas cas ticket rw occ; do
-  for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS"); do
+  for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS" 2>/dev/null); do
     [ "$t" -gt "$MAX_THREADS" ] && continue
     $BIN --lock "$lock" --workload mutex --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --csv "$CSV"
   done
@@ -30,7 +30,7 @@ done
 
 echo "=== RW workload (reader-writer, 80% reads) ==="
 for lock in rw occ; do
-  for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS"); do
+  for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS" 2>/dev/null); do
     [ "$t" -gt "$MAX_THREADS" ] && continue
     $BIN --lock "$lock" --workload rw --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --read_pct 80 --csv "$CSV"
   done
@@ -39,7 +39,7 @@ done
 
 echo "=== RW workload (reader-writer, 95% reads) ==="
 for lock in rw occ; do
-  for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS"); do
+  for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS" 2>/dev/null); do
     [ "$t" -gt "$MAX_THREADS" ] && continue
     $BIN --lock "$lock" --workload rw --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --read_pct 95 --csv "$CSV"
   done
@@ -47,7 +47,7 @@ for lock in rw occ; do
 done
 
 echo "=== RCU workload (90% reads) ==="
-for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS"); do
+for t in 1 2 4 8 $(seq 16 16 "$MAX_THREADS" 2>/dev/null); do
   [ "$t" -gt "$MAX_THREADS" ] && continue
   $BIN --lock rcu --workload rcu --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 1 --read_pct 90 --csv "$CSV"
 done
