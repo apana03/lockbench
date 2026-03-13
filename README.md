@@ -1,6 +1,6 @@
 # lockbench
 
-Benchmarks for synchronization primitives in the context of concurrent data structures.
+Benchmarks for synchronization primitives across ARM64 and x86_64.
 
 ## Primitives
 
@@ -16,9 +16,106 @@ Benchmarks for synchronization primitives in the context of concurrent data stru
 
 ## Benchmarks
 
-- **lockbench** — raw lock/unlock throughput with configurable critical section work
-- **arraybench** — contention on an array of cache-line-padded locks (exclusive, RW, or OCC)
-- **indexbench** — concurrent hash table with per-bucket locking, uniform/Zipfian keys
+### lockbench
+
+Raw lock/unlock throughput on a **single shared lock**. Threads run a tight loop
+of lock → optional busy-work → unlock. Three workload modes:
+
+- **mutex** — all threads use exclusive `lock()`/`unlock()`. Works with every
+  primitive. Measures pure lock acquisition overhead under full contention.
+- **rw** — threads call `read_lock()` or `write_lock()` based on `--read_pct`.
+  Available for RW and OCC locks. Measures how well the lock allows reader
+  parallelism.
+- **rcu** — readers announce an epoch and read a shared pointer; writers swap
+  the pointer and wait for all readers to drain. Measures epoch-based
+  read scaling.
+
+### arraybench
+
+Contention on an **array of independent locks**. Each thread picks a random lock
+index, acquires it, does optional busy-work, and releases. The number of locks
+(`--num_locks`) controls contention density — fewer locks means more collisions.
+
+For exclusive locks (TAS, TTAS, CAS, Ticket), every operation is a plain
+`lock()`/`unlock()`. For RW and OCC locks, each operation is randomly chosen as
+a read-lock or write-lock based on `--read_pct`.
+
+All locks are cache-line padded (`alignas(64)`) to isolate true contention from
+false sharing. There is no underlying data structure — the benchmark measures
+pure lock contention patterns across the array.
+
+### indexbench
+
+Concurrent hash table with per-bucket locking. Supports uniform and Zipfian key
+distributions. Operations: get, put, delete with configurable ratios.
+
+## How Measurements Work
+
+### Timing Model
+
+All benchmarks use the same measurement pattern: run for a fixed wall-clock
+duration and count completed operations, rather than timing individual operations.
+
+```
+ barrier  ──►  warmup phase  ──►  measurement phase  ──►  stop
+   │              │                    │                      │
+   │         threads run but       measuring=true          stop=true
+   │         ops not counted       ops are counted         threads join
+   │              │                    │                      │
+   │              │                 t0=now()              t1=now()
+   └── all threads
+       synchronized
+```
+
+1. **Barrier synchronization.** All worker threads are spawned and wait at a
+   `start_barrier` (spin-barrier using `fetch_add` + busy-wait). The main thread
+   waits until all workers have arrived, then releases them simultaneously. This
+   ensures no thread starts work before the others are ready.
+
+2. **Warmup phase.** Workers run the full benchmark loop (lock/unlock with
+   optional `cs_work`) but do not count operations. The warmup lets caches warm
+   up, branch predictors train, and OS scheduling stabilize. Default: 1 second.
+
+3. **Measurement phase.** The main thread sets `measuring=true` (relaxed store)
+   and records `t0 = steady_clock::now()`. Workers check `measuring` after each
+   operation and increment a thread-local counter only when it is true. After
+   `--seconds` seconds, the main thread sets `stop=true` and joins all threads,
+   then records `t1`.
+
+4. **Aggregation.** Each thread's local count is accumulated into `total_ops`.
+   Throughput is `total_ops / (t1 - t0)`, latency is `(t1 - t0) / total_ops`
+   in nanoseconds. Per-thread counts are used to compute fairness (min/max ratio).
+
+### Fairness Metric
+
+Fairness is reported as `min_ops / max_ops` across all threads. A ratio of 1.0
+means every thread completed the same number of operations. Lower ratios indicate
+starvation — some threads were starved of lock acquisitions while others
+dominated.
+
+### Critical Section Simulation
+
+Critical section work is simulated via `busy_work(iters)`:
+
+```cpp
+inline void busy_work(std::uint64_t iters) {
+  for (std::uint64_t i = 0; i < iters; ++i) {
+    asm volatile("" ::: "memory");
+  }
+}
+```
+
+The compiler barrier (`asm volatile("" ::: "memory")`) prevents the loop from
+being optimized away without executing any real instruction inside it. Each
+iteration is roughly 1-2 cycles on ARM64. This avoids timer-based approaches
+that would add measurement noise to short critical sections.
+
+### CSV Output
+
+All benchmarks support `--csv <file>` to append one row per run. The header is
+auto-written when the file is empty or missing. Columns include lock type,
+thread count, parameters, total/read/write ops, throughput (ops/s), latency
+(ns/op), and per-thread fairness metrics.
 
 ## Build
 
@@ -45,7 +142,7 @@ cmake --build build
 # lock array (exclusive locks)
 ./build/arraybench --lock ttas --threads 4 --num_locks 64
 
-# lock array (OCC with 80% read_lock / 20% write_lock per-operation probability)
+# lock array (OCC with 80% read / 20% write per-operation probability)
 ./build/arraybench --lock occ --threads 4 --num_locks 64 --read_pct 80
 
 # concurrent hash index (uniform keys)
@@ -53,14 +150,6 @@ cmake --build build
 
 # concurrent hash index (Zipfian skew)
 ./build/indexbench --lock occ --dist zipfian --threads 8 --read_pct 80 --insert_pct 10
-```
-
-## CSV Output
-
-All benchmarks support `--csv <file>` to append results in CSV format. The header row is auto-created if the file is empty or missing. Sweep scripts write to `results/`.
-
-```bash
-./build/lockbench --lock ttas --workload mutex --threads 4 --csv results/lockbench.csv
 ```
 
 ## Sweep Scripts
@@ -104,8 +193,6 @@ Produces individual files per lock function (e.g. `asm/tas_lock.s`, `asm/occ_rea
 
 ### arraybench
 
-Each thread picks a random lock from the array, acquires it, optionally does busy work, and releases. Locks are cache-line padded (`alignas(64)`) to isolate true contention from false sharing. For RW and OCC locks, `--read_pct` controls the per-operation probability of using `read_lock()` vs `write_lock()` — every lock in the array sees the same statistical read/write mix.
-
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--lock` | `tas\|ttas\|cas\|ticket\|rw\|occ` | `ttas` |
@@ -133,10 +220,6 @@ Each thread picks a random lock from the array, acquires it, optionally does bus
 | `--key_range` | key space size | 1000000 |
 | `--prefill` | keys to pre-insert | 500000 |
 | `--csv` | append results as CSV to file | — |
-
-## Critical Section Simulation
-
-Critical section work is simulated via `busy_work(iters)` — a tight loop with a compiler barrier (`asm volatile("" ::: "memory")`) that prevents optimization. Each iteration is roughly 1–2 cycles on ARM64. This avoids the overhead of timer-based approaches (`chrono::steady_clock`) which can dominate short critical sections.
 
 ## Project Structure
 
@@ -170,4 +253,5 @@ EXPERIMENT.md        detailed results and analysis
 
 ## Results
 
-See [EXPERIMENT.md](EXPERIMENT.md) for detailed benchmark results and assembly analysis.
+See [EXPERIMENT.md](EXPERIMENT.md) for detailed benchmark results, cross-architecture
+comparisons (ARM64 vs x86_64), and assembly analysis.

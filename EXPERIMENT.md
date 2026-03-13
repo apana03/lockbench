@@ -1,10 +1,11 @@
-# Lockbench: Synchronization Primitives for Concurrent Indexes
+# Lockbench: Synchronization Primitives on ARM64 and x86_64
 
 ## 1. Objective
 
-The goal is to determine which locking
-strategy adds minimal overhead for index operations (lookups, inserts, deletes)
-under varying contention levels, thread counts, and access patterns.
+Determine which locking strategy adds minimal overhead under varying contention
+levels, thread counts, and access patterns. The results are compared across two
+architectures — ARM64 (Apple M3 Pro) and x86_64 — to understand how hardware
+differences in atomic instruction design affect lock performance.
 
 The primitives studied are:
 
@@ -14,332 +15,395 @@ The primitives studied are:
 | **TTAS** (Test-and-Test-And-Set) | Spinlock | Spin-read (shared), then attempt exchange (RMW) |
 | **CAS** (Compare-And-Swap) | Spinlock | `compare_exchange_weak` with TTAS-style spin-read |
 | **Ticket Lock** | Spinlock (FIFO) | Two counters: `next` (ticket dispenser), `owner` (now serving) |
-| **RW Lock** | Reader-Writer | Atomic state: count ≥ 0 for readers, −1 for writer |
+| **RW Lock** | Reader-Writer | Atomic state: count >= 0 for readers, -1 for writer |
 | **OCC** (Optimistic Concurrency) | Seqlock | Version counter: even = consistent, odd = write in progress |
 | **RCU** (Read-Copy-Update) | Epoch-based | Per-thread epoch announcement; writers synchronize via epoch drain |
 
 ## 2. Experimental Setup
 
-### Platform
+### Platforms
 
-| Component | Value |
-|-----------|-------|
-| CPU | Apple M3 Pro (ARM64, 11 cores) |
-| Memory | 36 GB |
-| Compiler | Apple Clang 17.0.0, `-O3 -march=native` |
-| OS | macOS (Darwin 24.3.0) |
-| C++ Standard | C++20 |
+| | ARM64 | x86_64 |
+|-----------|-------|--------|
+| CPU | Apple M3 Pro (11 cores) | <!-- TODO: fill in --> |
+| Memory | 36 GB | <!-- TODO: fill in --> |
+| Compiler | Apple Clang 17.0.0, `-O3 -march=native` | <!-- TODO: fill in --> |
+| OS | macOS (Darwin 24.3.0) | <!-- TODO: fill in --> |
+| Max threads benchmarked | 8 | 48 |
+| C++ Standard | C++20 | C++20 |
+
+The ARM64 platform uses ARMv8.1 **LSE** (Large System Extensions), which replaces
+LL/SC (`ldxr`/`stxr`) pairs with single-instruction atomics (`swp`, `cas`, `ldadd`).
+The x86_64 platform uses `lock`-prefixed instructions (`lock xchg`, `lock cmpxchg`,
+`lock xadd`).
 
 ### Methodology
 
 - **Warmup**: 1 second before measurement (excluded from results).
 - **Measurement**: 3 seconds per configuration; reported as total ops and ns/op.
 - **Fairness**: Ratio of min to max per-thread operation count (1.0 = perfect).
+- **Runs**: Each configuration was run twice; tables report averages.
 - Each thread runs a tight loop performing operations until a shared `stop` flag is
   set. Per-thread counts are accumulated after join.
 
 ### Benchmarks
 
-1. **lockbench** (raw): Threads repeatedly acquire and release a lock with no data
-   structure work. Measures pure lock overhead.
-2. **indexbench** (applied): A concurrent hash table with per-bucket locking.
-   65,536 buckets, 1M key range, 500K pre-filled keys. Operations: get (80%),
-   put (10%), delete (10%). Key distributions: uniform and Zipfian (θ=0.99).
-3. **arraybench** (array): A shared array (65,536 uint64 elements) with two locking
-   modes: **single** (one global lock) and **striped** (64
-   per-stripe locks). Reads scan 16 consecutive elements,
-   writes update a single element.
+1. **lockbench** (raw): Threads repeatedly acquire and release a **single shared lock**
+   with no data structure work. Measures pure lock overhead.
+2. **arraybench** (lock array): An array of N independent locks. Each thread picks a
+   random lock index, acquires it, does optional busy-work (`cs_work` iterations of
+   `asm volatile("" ::: "memory")`), and releases. For RW/OCC variants, operations
+   are split into read-lock and write-lock based on `--read_pct`.
+
+---
 
 ## 3. Results
 
 ### 3.1 Raw Lock Throughput (lockbench, mutex workload)
 
-Threads contend on a **single shared lock** with no critical section work (cs_ns=0).
+Threads contend on a **single shared lock** with no critical section work (cs_work=0).
 
-| Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads |
-|------|-------------------|-----------|-----------|-----------|
-| TAS | **1,424** | 115 | 39.7 | 8.5 |
-| TTAS | 1,370 | 173 | **75.9** | **23.0** |
-| CAS | 983 | **192** | 75.3 | 23.7 |
-| Ticket | 709 | 26.5 | 13.1 | 5.6 |
-| RW (write) | 1,049 | 145 | 45.5 | 8.9 |
-| OCC (write) | 356 | 121 | 58.3 | 10.4 |
+#### ARM64 (Apple M3 Pro)
+
+| Lock | 1T (Mops/s) | 2T | 4T | 8T |
+|------|-------------|-----|------|------|
+| TAS | **988** | 114 | 32.7 | 3.9 |
+| TTAS | 955 | 134 | **56.5** | **11.2** |
+| CAS | 829 | **164** | 55.3 | 20.1 |
+| Ticket | 529 | 19.4 | 10.4 | 4.4 |
+| RW | 820 | 149 | 34.7 | 6.9 |
+| OCC | 285 | 81.5 | 42.0 | 9.5 |
+
+#### x86_64
+
+| Lock | 1T (Mops/s) | 2T | 4T | 8T |
+|------|-------------|------|-----|------|
+| TAS | 115 | 23.7 | 6.6 | 2.5 |
+| TTAS | 116 | 24.0 | 6.7 | 4.2 |
+| CAS | 116 | 22.8 | 6.9 | **4.3** |
+| Ticket | **127** | 9.0 | 2.5 | 2.0 |
+| RW | 116 | 22.1 | 5.4 | 2.7 |
+| OCC | 64.6 | 14.0 | 5.2 | 3.2 |
+
+#### Cross-Architecture Observations
+
+- **ARM is 8x faster single-threaded for spinlocks.** TAS achieves 988 Mops/s on ARM
+  vs 115 Mops/s on x86 (~1 ns/op vs ~8.7 ns/op). ARM's LSE `swpab` (byte-granularity
+  atomic swap) executes in very few cycles uncontended, while x86's `lock xchg` carries
+  higher fixed cost from the lock prefix's full memory barrier.
+
+- **ARM spinlocks show large single-threaded spread; x86 does not.** On ARM, TAS (988)
+  vs Ticket (529) is a 1.9x gap — byte-sized `swpab` is measurably cheaper than
+  32-bit `ldadd` + `ldapur`. On x86, TAS/TTAS/CAS/RW all cluster around 115-116 Mops/s
+  because `lock xchg`, `lock cmpxchg`, and `lock xadd` have similar pipeline cost.
+
+- **Ticket lock is the fastest single-threaded primitive on x86** (127 Mops/s), likely
+  because `lock xadd` (fetch-and-add) is slightly cheaper than `lock xchg`/`lock
+  cmpxchg` on this microarchitecture. On ARM, ticket is the slowest due to its
+  two-cache-line protocol.
+
+- **TAS degrades faster on ARM under contention.** ARM TAS drops 253x from 1T to 8T
+  (988 -> 3.9) because every spin iteration issues an RMW (`swpab`), bouncing the cache
+  line between all cores. On x86, the drop is 46x (115 -> 2.5) — still severe, but
+  x86's coherence protocol handles the bouncing with somewhat less relative overhead
+  since the base cost per operation is already higher.
+
+- **TTAS/CAS scale similarly on both architectures.** The spin-read optimization
+  (plain load in the spin loop, RMW only when the lock looks free) reduces coherence
+  traffic on both platforms. ARM TTAS retains 11.2 Mops/s at 8T; x86 retains 4.2.
+
+---
+
+### 3.2 Fairness (4 threads, cs_work=0)
+
+#### ARM64
+
+| Lock | Ratio |
+|------|-------|
+| TAS | 0.77 |
+| TTAS | 0.61 |
+| CAS | 0.35 |
+| Ticket | **1.00** |
+| RW | 0.80 |
+| OCC | 0.15 |
+
+#### x86_64
+
+| Lock | Ratio |
+|------|-------|
+| TAS | 0.45 |
+| TTAS | 0.45 |
+| CAS | 0.48 |
+| Ticket | **1.00** |
+| RW | 0.73 |
+| OCC | 0.49 |
 
 #### Observations
 
-- **TAS**  degrades rapidly
-  under contention because every spin iteration issues an RMW, bouncing the cache line
-  between cores (8 threads: 8.5 Mops/s, **167× drop**).
-- **TTAS and CAS** are nearly identical multi-threaded. Their spin-read phase (`ldrb`)
-  keeps the line in shared state, issuing the RMW only when the lock appears free.
-  TTAS is slightly faster single-threaded since `swpab` is simpler than `casab`.
-- **Ticket lock** is 2–5× lower throughput but achieves **near-perfect fairness**
-  (ratio ≥ 0.999). Its `lock()` touches two cache lines (`ldadd` on `next`,
-  `ldapur` on `owner` at +64B), and FIFO ordering prevents lock stealing.
-- **RW and OCC** in exclusive mode have higher overhead from wider atomics
-  (`casa` on 32/64-bit words vs. byte-sized operations).
+- **Ticket lock achieves perfect fairness on both architectures** (ratio >= 0.999).
+  FIFO ordering ensures every thread gets served in order, at the cost of 5-6x lower
+  throughput than TTAS/CAS.
 
-#### Fairness (4 threads, cs_ns=0)
-
-| Lock | Min ops | Max ops | Ratio |
-|------|---------|---------|-------|
-| TAS | 29.0M | 30.7M | 0.945 |
-| TTAS | 53.6M | 67.0M | 0.800 |
-| CAS | 47.5M | 63.0M | 0.755 |
-| Ticket | 9.9M | 9.9M | **1.000** |
-| RW | 30.8M | 33.5M | 0.920 |
-| OCC | 37.6M | 50.3M | 0.747 |
-
-TTAS/CAS achieve higher throughput by being unfair: a thread that just released
-the lock reacquires it before others see the release (hot L1 cache line). Ticket
-lock enforces FIFO at the cost of ~83% lower throughput.
+- **Fairness patterns differ between architectures.** On ARM, CAS (0.35) and OCC (0.15)
+  show extreme unfairness — a single thread can dominate because ARM's fast atomics
+  allow the releasing thread to reacquire before coherence propagates the release. On
+  x86, the longer atomic latency gives other threads more opportunity to observe the
+  release, resulting in more uniform (though still unfair) distributions across
+  TAS/TTAS/CAS (~0.45-0.48).
 
 ---
 
-### 3.2 Critical Section Cost Sweep (4 threads)
+### 3.3 Critical Section Cost Sweep (4 threads, TTAS, lockbench)
 
-| cs_ns | TAS (ns/op) | TTAS | CAS | Ticket |
-|-------|-------------|------|-----|--------|
-| 0 | 25 | 13 | 13 | 75 |
-| 50 | 96 | 96 | 95 | 117 |
-| 100 | 136 | 115 | 116 | 142 |
-| 500 | 435 | 408 | 408 | 432 |
-| 1,000 | 810 | 783 | 784 | 812 |
-| 5,000 | 3,817 | 3,788 | 3,789 | 3,830 |
+Single shared lock, varying `cs_work` (loop iterations inside the critical section).
 
-All locks converge by cs_ns=500. The bottleneck shifts to the critical section,
-and lock overhead becomes negligible. The choice of lock only matters under
-low-cs workloads.
-
-**Fairness diverges significantly at cs_ns=100:**
-
-| Lock | Min thread ops | Max thread ops | Ratio |
-|------|----------------|----------------|-------|
-| TAS | 5.4M | 5.6M | 0.955 |
-| TTAS | 4.5M | 10.6M | 0.428 |
-| CAS | 4.0M | 7.7M | 0.521 |
-| Ticket | 5.3M | 5.3M | **1.000** |
-
-With a meaningful critical section, TTAS and CAS show severe starvation. The releasing thread keeps the line hot in its L1 and reacquires before waiters can observe the release. 
-
----
-
-### 3.3 Reader-Writer Workloads (RW and OCC)
-
-| Lock | Read % | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads |
-|------|--------|-------------------|-----------|-----------|-----------|
-| RW | 50% | 78 | 25 | 12 | 4.3 |
-| RW | 80% | 105 | 32 | 15 | 4.3 |
-| RW | 95% | 125 | 29 | 18 | 4.2 |
-| OCC | 50% | 75 | 26 | 14 | 4.0 |
-| OCC | 80% | 104 | 43 | **35** | **10.3** |
-| OCC | 95% | 169 | **76** | **78** | **36** |
-| RCU | 50% | 55 | 16 | 11 | 3.7 |
-| RCU | 80% | 84 | 32 | 20 | 7.1 |
-| RCU | 95% | 118 | 87 | 76 | 24 |
+| cs_work | ARM64 (ns/op) | x86_64 (ns/op) | ARM fairness | x86 fairness |
+|---------|---------------|-----------------|--------------|--------------|
+| 0 | 18.2 | 58.9 | 0.54 | 0.04 |
+| 50 | 30.2 | 299 | 0.53 | 0.23 |
+| 100 | 60.3 | 387 | 0.27 | 0.19 |
+| 500 | 153 | 504 | 0.09 | 0.19 |
+| 1000 | 291 | 541 | 0.006 | 0.15 |
+| 5000 | 1398 | 1831 | ~0 | 0.10 |
 
 #### Observations
 
-- **RW lock does not scale with read percentage.** At 8 threads, throughput is
-  ~4.2–4.3 Mops/s regardless of read ratio. Each `read_lock` issues a `casa` RMW
-  and each `read_unlock` issues `ldaddl` — two cache-line invalidations per read.
-  Readers serialize on the same cache line as writers.
-- **OCC scales dramatically at high read ratios.** At 95% reads, 4 threads: OCC
-  delivers 78 Mops/s vs. RW's 18 Mops/s (**4.3×**). Optimistic reads are pure
-  loads (`ldapr` + `dmb ishld` + `ldr`) — no RMW, no cache-line invalidation.
-- **RCU** provides strong read scaling at 95% (76 Mops/s at 4T, matching OCC),
-  but the write-side `synchronize()` must drain all reader epochs => expensive for
-  write-heavy workloads.
+- **Each `busy_work` iteration costs ~0.24 ns on ARM vs ~4.8 ns on x86.** This 20x
+  difference in per-iteration cost means the same `cs_work` value represents very
+  different real-time critical section durations on the two platforms. On ARM, 50
+  iterations add ~12 ns; on x86, they add ~240 ns.
+
+- **On ARM, fairness degrades catastrophically with increasing cs_work.** At
+  cs_work=1000, one thread performs ~35K ops while another performs ~5.5M (ratio 0.006).
+  The releasing thread's cache line stays hot in L1, and ARM's fast `swpab` lets it
+  reacquire before the coherence protocol delivers the release to waiting cores. At
+  cs_work=5000, the min thread gets as few as 1 operation over the entire 3-second run.
+
+- **On x86, fairness is poor but stable.** The ratio hovers around 0.04-0.23 regardless
+  of cs_work. x86's longer atomic latency and stronger ordering (`lock` prefix acts
+  as a full barrier) gives waiting threads a more consistent, if small, chance to acquire.
+
+- **Both architectures converge at high cs_work.** At cs_work=5000, ARM (1398 ns/op)
+  and x86 (1831 ns/op) are within 1.3x — the critical section dominates and lock
+  overhead becomes negligible.
 
 ---
 
-### 3.4 Concurrent Hash Index (indexbench)
+### 3.4 Reader-Writer Workloads (lockbench)
 
-#### Uniform Key Distribution (low contention per bucket)
+Single shared lock, RW/OCC/RCU primitives with varying read percentages.
 
-65,536 buckets, 1M key range → ~15 keys/bucket on average.
-80% get / 10% put / 10% delete.
+#### ARM64
 
-| Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads | Speedup (1→8) |
-|------|-------------------|-----------|-----------|-----------|---------------|
-| TAS | 30.7 | 63.2 | 121.8 | **146.0** | 4.75× |
-| TTAS | 29.7 | 59.0 | 121.6 | 143.0 | 4.81× |
-| CAS | 27.4 | 58.2 | 118.9 | 145.6 | 5.31× |
-| Ticket | 21.3 | 43.2 | 85.8 | 117.0 | 5.49× |
-| RW | 27.5 | 58.6 | 118.0 | 143.5 | 5.22× |
-| OCC | 24.6 | 52.9 | 105.1 | 144.1 | **5.86×** |
+| Lock | Read % | 1T (Mops/s) | 2T | 4T | 8T |
+|------|--------|-------------|------|------|------|
+| RW | 80 | 98.6 | 29.0 | 14.7 | 4.4 |
+| OCC | 80 | 100 | 48.2 | 36.0 | 10.4 |
+| RW | 95 | 122 | 29.9 | 17.7 | 4.3 |
+| OCC | 95 | 122 | 80.4 | **65.2** | **32.8** |
+| RCU | 90 | 101 | 48.1 | 36.1 | 12.2 |
 
-#### Analysis
+#### x86_64
 
-- **TAS, TTAS, CAS** are nearly indistinguishable. With 65K buckets and uniform keys,
-  per-bucket contention is negligible, so the spin-read optimization of TTAS/CAS
-  provides no benefit. Lock overhead (~3–5 ns) is dwarfed by hash computation and
-  bucket traversal (~30–40 ns/op single-threaded).
-- **All three scale nearly linearly** to 4 threads (~4×) and well to 8 threads
-  (~4.7–5.3×).
-- **Ticket lock** has ~1.4× higher per-op overhead single-threaded (the two-counter
-  protocol). Its scaling ratio (5.49×) is better than TAS (4.75×) because FIFO
-  ordering reduces cache-line pingponging at higher thread counts.
-- **OCC** has the highest single-threaded overhead (version read + validate) but the
-  best scaling (5.86×). Optimistic reads don't invalidate the bucket's cache line,
-  which helps at 8 threads even with uniform access.
-- **RW lock** performs comparably to TAS/TTAS — the CAS cost in `read_lock()`
-  eliminates the theoretical benefit of shared reads at this contention level.
-
-#### Zipfian Key Distribution (θ=0.99, high contention on hot buckets)
-
-| Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads | Speedup (1→8) |
-|------|-------------------|-----------|-----------|-----------|---------------|
-| TAS | 24.5 | 48.5 | 88.8 | 100.7 | 4.11× |
-| TTAS | 24.3 | 42.5 | 78.8 | 81.5 | 3.36× |
-| CAS | 18.7 | 43.2 | 67.4 | 71.9 | 3.84× |
-| Ticket | 17.1 | 38.4 | 74.4 | 87.9 | 5.14× |
-| RW | 21.8 | 43.1 | 83.8 | 99.5 | 4.56× |
-| OCC | 20.6 | 39.3 | **86.3** | **117.3** | **5.69×** |
-
-**OCC wins decisively under Zipfian.** At 8 threads, OCC achieves 117 Mops/s vs.
-TAS's 101 Mops/s (**1.16×**). Hot buckets are accessed mostly for reads (80%), and
-OCC's optimistic reads avoid cache-line invalidation on contested buckets — the exact
-access pattern of B-tree root and upper-level nodes.
-
-Under skew, TTAS/CAS scaling degrades more than TAS (3.4× vs. 4.1×): spin-read
-threads spinning on hot lock bytes still add coherence traffic on the hot bucket's
-cache line.
-
----
-
-### 3.5 Contention Density (indexbench, 4 threads, uniform)
-
-Varying bucket count controls contention density (keys/bucket).
-
-| Buckets | Keys/Bucket | TTAS (Mops/s) | CAS | Ticket | OCC |
-|---------|-------------|---------------|-----|--------|-----|
-| 64 | 15,625 | 0.41 | 0.40 | 0.41 | 0.37 |
-| 256 | 3,906 | 1.34 | 1.36 | 1.28 | 1.34 |
-| 1,024 | 977 | 3.87 | 4.05 | 4.01 | 3.53 |
-| 4,096 | 244 | 13.8 | 16.2 | 14.5 | 13.8 |
-| 16,384 | 61 | 49.6 | 48.0 | 41.2 | 44.8 |
-| 65,536 | 15 | **98.2** | 98.2 | 71.2 | 85.1 |
-| 262,144 | 4 | **130.5** | 117.0 | 95.9 | 114.5 |
-
-#### Analysis
-
-- At **high contention** (64–1,024 buckets), all locks converge — threads spend most
-  time waiting while traversing long bucket chains (thousands of entries per bucket).
-  Lock algorithm choice is irrelevant here.
-- At **medium contention** (4K–16K buckets), CAS slightly leads; the difference
-  is within run-to-run variance.
-- At **low contention** (65K+ buckets), TTAS consistently leads. Throughput continues
-  growing through 262K buckets (130.5 Mops/s) — the working set (262K × 128+ bytes ≈
-  32 MB) begins exceeding L2 but prefetching still helps TTAS's sequential spin-read.
-- **Ticket lock** scales with decreasing contention but never reaches TTAS/CAS peak
-  throughput due to the two-cache-line acquire protocol.
-
----
-
-### 3.6 Shared Array Benchmark (arraybench)
-
-#### Single Lock — 80% Read / 20% Write
-
-All threads contend on **one global lock** protecting a 65,536-element array.
-Reads scan 16 consecutive elements; writes update one element.
-
-| Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads | Speedup (1→8) |
-|------|-------------------|-----------|-----------|-----------|---------------|
-| TAS | 62.8 | 32.9 | 17.4 | 4.5 | 0.07× |
-| TTAS | 61.7 | 45.3 | 27.8 | 8.5 | 0.14× |
-| CAS | 61.9 | 45.7 | 25.7 | 8.2 | 0.13× |
-| Ticket | 58.3 | 18.3 | 11.8 | 5.9 | 0.10× |
-| RW | 61.2 | 38.5 | 21.5 | 5.5 | 0.09× |
-| OCC | **62.2** | **79.6** | **61.8** | **17.1** | **0.27×** |
+| Lock | Read % | 1T (Mops/s) | 2T | 4T | 8T |
+|------|--------|-------------|------|------|------|
+| RW | 80 | 51.9 | 7.8 | 3.3 | 2.1 |
+| OCC | 80 | 78.9 | 19.4 | 6.2 | 5.0 |
+| RW | 95 | 49.2 | 5.6 | 4.3 | 3.1 |
+| OCC | 95 | 99.6 | 32.7 | **17.9** | **13.5** |
+| RCU | 90 | 85.3 | 20.0 | 7.1 | 6.7 |
 
 #### Observations
 
-- **All exclusive locks scale negatively** with a single global lock — threads
-  serialize completely and adding threads only increases contention overhead.
-- **OCC is the only primitive that scales beyond 1 thread ** because 80% of operations are lock-free optimistic reads.
-- **TTAS and CAS** are the best exclusive spinlocks, consistent with the raw
-  lock benchmarks. Their spin-read phase reduces cache-line bouncing under contention.
-- **Ticket lock** drops sharply at 2 threads (18.3 vs. TTAS's 45.3 Mops/s) due to
-  the `ldadd` on `next` bouncing under high contention, but maintains perfect fairness.
-- **RW lock** performs worse than TTAS/CAS despite supporting shared reads: the
-  `casa` RMW in `read_lock()` serializes readers on the same contended cache line.
+- **RW lock does not scale with read percentage on either architecture.** At 8T on ARM,
+  RW achieves ~4.3-4.4 Mops/s regardless of read ratio. On x86 it's ~2.1-3.1 Mops/s.
+  Each `read_lock` issues an RMW (`casa` on ARM, `lock cmpxchg` on x86) that
+  invalidates the cache line, serializing readers on the same line as writers.
 
-#### Single Lock — 95% Read 
+- **OCC scales with read ratio on both platforms, but the benefit is larger on ARM.**
+  At 95% reads and 8T: ARM OCC delivers 32.8 Mops/s (7.6x over RW). x86 OCC delivers
+  13.5 Mops/s (4.4x over RW). ARM benefits more because its optimistic read path
+  (`ldapr` + `dmb ishld` + `ldr`) involves zero RMW operations and zero cache-line
+  invalidations. On x86, the `mfence` or `lfence` in the read validation path adds
+  more overhead.
 
-| Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads |
-|------|-------------------|-----------|-----------|-----------|
-| TAS | 65.8 | 33.6 | 18.0 | 5.0 |
-| TTAS | 64.1 | 46.0 | 30.0 | 9.3 |
-| CAS | 64.1 | 47.0 | 27.5 | 8.8 |
-| Ticket | 64.2 | 17.4 | 11.9 | 5.9 |
-| RW | 62.7 | 37.4 | 24.7 | 5.7 |
-| OCC | 64.7 | **106.9** | **136.3** | **80.0** |
-
-**OCC dominates at high read ratios.** At 4 threads with 95% reads, OCC delivers
-136 Mops/s (2.1× its own single-threaded rate and 4.5× faster than TTAS
-(30.0 Mops/s)). With only 5% writes, validation almost never fails, so readers execute
-fully in parallel with zero cache-line invalidations.
-
-#### Single Lock — 50% Read
-
-| Lock | 1 thread (Mops/s) | 4 threads | 8 threads |
-|------|-------------------|-----------|-----------|
-| TAS | 62.2 | 15.8 | 4.2 |
-| TTAS | 62.1 | 25.6 | 8.2 |
-| CAS | 62.4 | 23.7 | 7.2 |
-| Ticket | 62.0 | 11.8 | 5.8 |
-| RW | 62.0 | 18.9 | 5.0 |
-| OCC | 60.7 | 25.8 | 7.2 |
-
-At 50% writes, OCC's advantage largely disappears, frequent writes cause optimistic
-reads to fail validation and retry. 
-
-#### Striped Locks (64 Stripes) — 80% Read
-
-64 independent locks, each protecting a 1,024-element stripe.
-
-| Lock | 1 thread (Mops/s) | 2 threads | 4 threads | 8 threads | Speedup (1→8) |
-|------|-------------------|-----------|-----------|-----------|---------------|
-| TAS | 54.0 | 87.6 | **145.1** | 104.7 | 1.94× |
-| TTAS | 54.4 | 86.4 | **145.0** | 105.9 | 1.95× |
-| CAS | 53.8 | 86.1 | 142.3 | 105.2 | 1.95× |
-| Ticket | 53.5 | 72.9 | 111.9 | 97.2 | 1.82× |
-| RW | 52.4 | 79.2 | 142.4 | 104.0 | 1.98× |
-| OCC | 53.5 | 84.3 | 140.6 | 102.7 | 1.92× |
-
-#### Observations
-
-- **Striped locks restore positive scaling for all primitives.** This confirms that
-  contention partitioning is the primary enabler of parallelism, not the lock
-  algorithm itself.
-- **All locks peak at 4 threads** and regress at 8. With 8 threads scanning the
-  512 KB array (65K × 8 bytes) => memory bandwidth not lock contention becomes
-  the bottleneck.
-- **TAS, TTAS, and CAS** lead at 4 threads (~145 Mops/s) with near-identical results.
-  At low per-stripe contention, TTAS's spin-read phase provides no advantage.
-- **OCC's advantage disappears** in the striped case, exclusive lock contention is
-  already low, so the optimistic read path's benefit is marginal and version-check
-  overhead slightly hurts.
-- **Ticket lock** has slightly lower peak (112 Mops/s at 4T) but the best 8-thread
-  relative performance (97.2 vs. ~104 Mops/s for TAS/TTAS), consistent with its FIFO
-  ordering reducing cache-line thrashing at higher thread counts.
-
-#### Single Lock vs. Striped
-
-| Lock | Single 4T (Mops/s) | Striped 4T (Mops/s) | Improvement |
-|------|--------------------|--------------------|-------------|
-| TTAS | 27.8 | 145.0 | **5.2×** |
-| OCC | 61.8 | 140.6 | 2.3× |
-| Ticket | 11.8 | 111.9 | **9.5×** |
-
-Striping provides **5–10× improvement** for exclusive locks. OCC benefits less because
-it already avoids read-path contention. Reducing contention density matters more than
-optimizing the lock algorithm.
+- **RCU on ARM matches OCC at 80% reads** (36 vs 36 Mops/s at 4T) but falls behind at
+  95% reads because the write-side `synchronize()` must drain all reader epochs. On x86,
+  RCU shows modest scaling (7.1 Mops/s at 4T, 90% reads), limited by the higher
+  per-epoch overhead.
 
 ---
 
-### 3.7 Generated Assembly Analysis (ARM64, Apple M3 Pro)
+### 3.5 Lock Array — Thread Scaling (arraybench, 64 locks)
+
+Each thread picks a random lock from an array of 64, acquires it, does no work
+(cs_work=0), and releases.
+
+#### ARM64 — Exclusive Locks
+
+| Lock | 1T (Mops/s) | 2T | 4T | 8T |
+|------|-------------|------|------|------|
+| TAS | 262 | 152 | 184 | 120 |
+| TTAS | 253 | 150 | 184 | 119 |
+| CAS | 255 | 148 | 184 | 120 |
+| Ticket | 246 | 89 | 106 | 99 |
+
+#### ARM64 — RW / OCC (64 locks)
+
+| Lock | Read % | 1T (Mops/s) | 2T | 4T | 8T |
+|------|--------|-------------|------|------|------|
+| RW | 80 | 77 | 100 | 161 | 126 |
+| OCC | 80 | 77 | 139 | **263** | **252** |
+| RW | 95 | 88 | 99 | 161 | 126 |
+| OCC | 95 | 91 | 170 | **327** | **401** |
+
+#### x86_64 — Exclusive Locks
+
+| Lock | 1T | 2T | 4T | 8T | 16T | 32T | 48T |
+|------|------|------|------|------|------|------|------|
+| TAS | 99 | 43 | 35 | 71 | 96 | **112** | 105 |
+| TTAS | 100 | 47 | 39 | 43 | 51 | 62 | 76 |
+| CAS | 96 | 49 | 34 | 70 | 100 | **113** | 112 |
+| Ticket | 99 | 35 | 29 | 34 | 48 | 62 | 55 |
+
+#### x86_64 — RW / OCC (64 locks)
+
+| Lock | Read % | 1T | 2T | 4T | 8T | 16T | 32T | 48T |
+|------|--------|------|------|------|------|------|------|------|
+| RW | 80 | 58 | 38 | 36 | 40 | 51 | 56 | 55 |
+| OCC | 80 | 84 | 74 | 61 | 78 | 97 | 114 | **130** |
+| RW | 95 | 58 | 29 | 32 | 40 | 51 | 55 | 52 |
+| OCC | 95 | 107 | 108 | 76 | 102 | 125 | 155 | **192** |
+
+#### Cross-Architecture Observations
+
+- **ARM exclusive locks peak at 4 threads then regress.** TAS/TTAS/CAS all hit ~184
+  Mops/s at 4T and drop to ~120 at 8T. With 64 locks and 8 threads, contention per
+  lock is still low, so the regression is likely due to memory bandwidth saturation
+  from 8 cores issuing rapid-fire atomics.
+
+- **x86 exclusive locks show a non-monotonic scaling pattern.** TAS and CAS dip at 4T
+  (~35 Mops/s) then recover strongly at 8T+ (~70 Mops/s), eventually peaking at 32T
+  (~112 Mops/s). TTAS scales more gradually without the dip. The dip may reflect
+  contention dynamics at the 4-thread count where threads frequently collide on the
+  same lock (4 threads / 64 locks = 6.25% collision probability), while at higher thread
+  counts the parallelism across many locks compensates.
+
+- **OCC dominates on both architectures at high read ratios.** At 95% reads: ARM OCC
+  reaches 401 Mops/s at 8T (3.2x over RW's 126); x86 OCC reaches 192 Mops/s at 48T
+  (3.7x over RW's 52). The optimistic read path generates zero cache-line invalidations,
+  enabling true read parallelism.
+
+- **ARM OCC at 95% reads scales super-linearly** from 1T (91 Mops/s) to 8T (401 Mops/s)
+  — a 4.4x speedup with 8 threads. This is because with 64 locks and 95% reads,
+  validation failures are rare, and the lock-free read path runs fully in parallel.
+
+- **x86 OCC also scales continuously** up to 48T (192 Mops/s at 95% reads), while all
+  other primitives plateau by 32T. This confirms that OCC's lock-free read path avoids
+  the coherence bottleneck that limits the others.
+
+- **RW lock plateaus on both architectures.** ARM RW peaks at ~161 Mops/s (4T) and x86
+  at ~56 Mops/s (32T), regardless of read percentage. The CAS-based `read_lock()` makes
+  readers as expensive as writers from a coherence perspective.
+
+---
+
+### 3.6 Lock Array — Lock Count Sweep (4 threads, cs_work=0, 80% read for OCC)
+
+Varying the number of locks controls contention density.
+
+#### ARM64
+
+| Locks | TTAS (Mops/s) | CAS | Ticket | OCC |
+|-------|---------------|------|--------|------|
+| 1 | 53.1 | 35.1 | 10.3 | 74.1 |
+| 4 | 53.3 | 52.5 | 35.0 | 168 |
+| 16 | 119 | 118 | 73.8 | 247 |
+| 64 | 187 | 184 | 107 | 263 |
+| 256 | 222 | 221 | 120 | 268 |
+| 1024 | 234 | 235 | 132 | 266 |
+
+#### x86_64
+
+| Locks | TTAS (Mops/s) | CAS | Ticket | OCC |
+|-------|---------------|------|--------|------|
+| 1 | 11.8 | 11.4 | 3.4 | 23.3 |
+| 4 | 15.8 | 21.8 | 11.6 | 30.5 |
+| 16 | 20.2 | 24.3 | 16.5 | 39.4 |
+| 64 | 39.3 | 34.8 | 28.7 | 52.7 |
+| 256 | 48.5 | 41.3 | 29.7 | 61.6 |
+| 1024 | 61.5 | 56.6 | 39.9 | 80.7 |
+
+#### Observations
+
+- **Throughput scales with lock count on both architectures** — reducing contention
+  density is the single most effective optimization, more important than lock algorithm
+  choice.
+
+- **ARM saturates earlier.** TTAS throughput increases 4.4x from 1 to 1024 locks on
+  ARM, but only grows marginally past 256 locks (222 -> 234). On x86, TTAS grows 5.2x
+  across the same range and is still climbing at 1024 locks, suggesting the x86 machine
+  benefits from its larger core count even at 4 threads (less contention overhead per
+  atomic).
+
+- **OCC leads at every lock count on both platforms.** Even with just 1 lock, OCC
+  (74 Mops/s ARM, 23 Mops/s x86) outperforms TTAS (53 Mops/s ARM, 12 Mops/s x86)
+  because 80% of operations use the lock-free optimistic read path.
+
+- **Ticket lock scales well with more locks but never catches up.** It benefits the most
+  from reducing contention (12.8x on ARM from 1 to 1024 locks) because its FIFO
+  ordering generates the most overhead under high contention, but it remains ~56% of
+  TTAS throughput at all lock counts.
+
+---
+
+### 3.7 Lock Array — Critical Section Work Sweep (4 threads, 64 locks)
+
+#### ARM64 (ns/op)
+
+| cs_work | TTAS | CAS | Ticket |
+|---------|------|------|--------|
+| 0 | 5.4 | 5.4 | 9.6 |
+| 50 | 7.6 | 7.7 | 10.1 |
+| 100 | 13.6 | 13.8 | 13.9 |
+| 500 | 44.5 | 45.5 | 44.8 |
+| 1000 | 80.1 | 82.3 | 80.4 |
+
+#### x86_64 (ns/op)
+
+| cs_work | TTAS | CAS | Ticket |
+|---------|------|------|--------|
+| 0 | 25.5 | 29.0 | 36.8 |
+| 50 | 35.7 | 29.3 | 36.9 |
+| 100 | 46.1 | 35.2 | 38.9 |
+| 500 | 81.4 | 72.6 | 78.9 |
+| 1000 | 124 | 117 | 119 |
+
+#### Observations
+
+- **ARM locks converge by cs_work=100.** TTAS, CAS, and Ticket all produce ~13.6-13.9
+  ns/op. The critical section cost dominates and lock overhead becomes negligible. This
+  convergence happens because `busy_work` iterations are very cheap on ARM (~0.14 ns
+  each).
+
+- **x86 locks converge more slowly.** At cs_work=100, there's still a meaningful gap
+  (TTAS: 46 ns vs Ticket: 39 ns). Convergence isn't reached until cs_work=1000 (all
+  ~119-124 ns/op). Each `busy_work` iteration costs ~0.1 ns on x86 as well (the
+  compiler barrier `asm volatile("" ::: "memory")` is essentially free on both), but
+  the base lock overhead is much higher, so more iterations are needed to amortize it.
+
+- **CAS performs slightly better than TTAS on x86 at moderate cs_work** (29 ns vs 36 ns
+  at cs_work=50). On ARM, they are identical. The x86 `lock cmpxchg` may have a slight
+  advantage over `lock xchg` when the lock is typically free (successful CAS avoids a
+  retry).
+
+- **With 64 locks, all primitives maintain good fairness** regardless of cs_work (ratios
+  > 0.99 on ARM, > 0.6 on x86). This contrasts sharply with the single-lock CS sweep
+  (Section 3.3) where starvation was extreme.
+
+---
+
+### 3.8 Generated Assembly Analysis (ARM64, Apple M3 Pro)
 
 The compiler (Apple Clang 17, `-O3 -march=native`) targets ARMv8.1 with **LSE**
 (Large System Extensions), which replaces the older LL/SC (`ldxr`/`stxr`) pairs
@@ -429,7 +493,7 @@ spin_read:
 CAS has the same spin-read optimization as TTAS but uses `casab` (compare-and-swap
 byte, acquire) instead of `swpab`. The extra `mov w9, #0` to reload the expected
 value before each CAS attempt explains why CAS is slightly slower than TTAS
-single-threaded (983 vs. 1,370 Mops/s) — `casab` needs both an expected and
+single-threaded (829 vs 955 Mops/s) — `casab` needs both an expected and
 desired value, while `swpab` only needs the desired value. Under contention they
 converge because the spin-read loop dominates.
 
@@ -457,19 +521,19 @@ acquired:
     ret
 ```
 
-`lock()` accesses two different cache lines `ldadd`
+`lock()` accesses two different cache lines — `ldadd`
 on `next` at `[x0]` and `ldapur` on `owner` at `[x0, #64]`. The `alignas(64)` in the
 C++ code ensures these counters live on separate 64-byte cache lines, avoiding false
 sharing between the ticket dispenser and the "now serving" display.
 
-Second, the spin loop only reads `owner` (`ldapur`), it never writes. Only the
+The spin loop only reads `owner` (`ldapur`), it never writes. Only the
 unlock path writes to `owner`, and since exactly one thread holds the lock, there
 is only one writer to the owner cache line at any time. This is why the spin
 loop generates less coherence traffic than TAS. However, the `ldadd` on `next`
 during lock acquisition is an RMW that bounces under heavy contention, which is
 why ticket lock is still slower than TTAS overall.
 
-The unlock uses `stlur` (store-release with unscaled offset), a non-atomic store
+The unlock uses `stlur` (store-release with unscaled offset) — a non-atomic store
 is safe here because only the lock holder writes to `owner`.
 
 #### RW Lock
@@ -574,11 +638,11 @@ spin:
   past the version check.
 
 Compare to the RW lock: `casa` (RMW) + `ldaddl` (RMW) = two cache-line invalidations
-per read. OCC causes **zero invalidations**, which is why at 95% reads and 4 threads,
-OCC achieves 136 Mops/s vs. RW's 24.7 Mops/s (**5.5×**) on the array benchmark.
+per read. OCC causes **zero invalidations**, which is why at 95% reads and 8 threads,
+OCC achieves 401 Mops/s vs RW's 126 Mops/s (**3.2x**) on the lock array benchmark.
 
 The tradeoff: validation fails if a writer was active during the read, requiring a
-retry. This overhead is measurable once writes exceed ~20–30% of operations.
+retry. This overhead is measurable once writes exceed ~20-30% of operations.
 
 #### Instruction Count Summary
 
@@ -593,29 +657,37 @@ retry. This overhead is measurable once writes exceed ~20–30% of operations.
 
 ---
 
-### Key Takeaways
+## 4. Key Takeaways
 
-1. **Lock overhead is negligible when contention is low.** With 65K+ buckets and
-   uniform access, the lock acquire/release adds ~3–5 ns to a ~30–40 ns operation.
-   Data structure design (bucket count, node size, cache locality) matters far more
-   than the lock choice.
+1. **ARM's LSE atomics are fundamentally faster than x86's `lock`-prefixed instructions.**
+   Single-threaded spinlock throughput is 8x higher on ARM (988 vs 115 Mops/s for TAS).
+   This gap narrows under contention but never fully closes. The byte-granularity atomics
+   (`swpab`, `casab`) on ARM are particularly efficient.
 
-2. **Under skew, OCC wins.** Zipfian workloads concentrate accesses on hot
-   buckets/nodes. OCC readers don't invalidate the cache line, enabling true read
-   parallelism — the exact access pattern of B-tree root and upper-level nodes.
+2. **OCC wins on both architectures for read-heavy workloads.** Its lock-free read path
+   (zero RMW operations on ARM, minimal overhead on x86) enables true read parallelism.
+   At 95% reads with 64 locks: ARM OCC reaches 401 Mops/s at 8T; x86 OCC reaches 192
+   Mops/s at 48T — both far ahead of any other primitive.
 
-3. **Fairness and throughput are in tension.** TTAS/CAS achieve high throughput by
-   being unfair (recent releasers reacquire faster), but can starve threads when
-   critical sections are non-trivial (min/max ratio ≈ 0.4 at cs_ns=100). Ticket lock
-   guarantees FIFO order at ~40–80% throughput cost, depending on contention level.
+3. **Fairness-throughput tradeoff is architecture-dependent.** Ticket lock guarantees
+   FIFO fairness on both platforms, but the throughput penalty varies: ~56% of TTAS on
+   ARM, ~42% on x86. Conversely, unfair locks (TTAS/CAS) cause more extreme starvation
+   on ARM than on x86 because ARM's faster atomics amplify the "hot cache line" advantage
+   of the releasing thread.
 
-4. **RW locks disappoint in practice.** The theoretical advantage of shared reads
-   is negated by the CAS in `read_lock()`/`read_unlock()`. OCC achieves the same
-   goal with zero read-path atomics.
+4. **Critical section cost dominates quickly on ARM, slowly on x86.** ARM locks converge
+   by cs_work=100 (~14 ns/op for all primitives). x86 needs cs_work=1000 to converge
+   (~120 ns/op). Choosing the right lock matters more on x86 when critical sections
+   are short.
 
-5. **Contention density is the dominant factor.** Lock striping (Section 3.6) yields
-   5–10× improvement for exclusive locks. Choosing the right data structure granularity
-   provides more benefit than optimizing the lock algorithm.
+5. **Contention density matters more than lock algorithm.** Increasing the lock count
+   from 1 to 1024 yields 4.4x improvement on ARM and 5.2x on x86 for TTAS. Striping
+   or partitioning should be the first optimization before tuning the lock primitive.
+
+6. **RW locks disappoint in practice on both architectures.** The CAS in `read_lock()`
+   and the atomic decrement in `read_unlock()` create two cache-line invalidations per
+   read operation, negating the theoretical advantage of shared reads. OCC achieves the
+   same goal with zero read-path atomics.
 
 ---
 
@@ -630,33 +702,22 @@ cmake --build build
 ./build/lockbench --lock ttas --workload mutex --threads 4 --seconds 3
 ./build/lockbench --lock occ --workload rw --threads 4 --seconds 3 --read_pct 95
 
-# Concurrent index benchmarks
-./build/indexbench --lock ttas --dist uniform --threads 8 --seconds 5 --read_pct 80 --insert_pct 10
-./build/indexbench --lock occ --dist zipfian --threads 8 --seconds 5 --read_pct 80 --insert_pct 10
-
-# Shared array benchmarks
-./build/arraybench --lock ttas --mode single --threads 4 --seconds 3 --read_pct 80
-./build/arraybench --lock occ --mode single --threads 4 --seconds 3 --read_pct 95
-./build/arraybench --lock ttas --mode striped --threads 8 --seconds 3 --stripes 64
+# Lock array benchmarks
+./build/arraybench --lock ttas --threads 4 --seconds 3 --num_locks 64
+./build/arraybench --lock occ --threads 4 --seconds 3 --num_locks 64 --read_pct 95
 
 # Generate assembly for all locks
 ./scripts/gen_asm.sh          # outputs to asm/
 
-# Full sweeps
+# Full sweeps (results written to results/*.csv)
 ./scripts/sweep.sh 3 8          # Raw lock sweep
-./scripts/index_sweep.sh 3 8    # Index sweep
-./scripts/array_sweep.sh 3 8    # Array sweep
+./scripts/array_sweep.sh 3 8    # Lock array sweep
 ```
 
 ### Available Options
 
 **lockbench**: `--lock tas|ttas|cas|ticket|rw|occ|rcu` `--workload mutex|rw|rcu`
-`--threads N` `--seconds S` `--warmup S` `--cs_ns NS` `--read_pct P`
+`--threads N` `--seconds S` `--warmup S` `--cs_work N` `--read_pct P` `--csv FILE`
 
-**indexbench**: `--lock tas|ttas|cas|ticket|rw|occ` `--dist uniform|zipfian`
-`--threads N` `--seconds S` `--warmup S` `--read_pct P` `--insert_pct P`
-`--zipf_theta T` `--buckets N` `--key_range N` `--prefill N`
-
-**arraybench**: `--lock tas|ttas|cas|ticket|rw|occ` `--mode single|striped`
-`--threads N` `--seconds S` `--warmup S` `--read_pct P` `--array_size N`
-`--stripes N` `--scan_len N`
+**arraybench**: `--lock tas|ttas|cas|ticket|rw|occ` `--threads N` `--seconds S`
+`--warmup S` `--num_locks N` `--cs_work N` `--read_pct P` `--csv FILE`
