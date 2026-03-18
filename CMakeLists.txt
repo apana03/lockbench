@@ -25,8 +25,14 @@ add_executable(arraybench bench/array_bench.cpp)
 target_include_directories(arraybench PRIVATE include)
 target_link_libraries(arraybench PRIVATE Threads::Threads)
 
+# --- locktest: lock correctness tests ---
+add_executable(locktest bench/lock_test.cpp)
+target_include_directories(locktest PRIVATE include)
+target_link_libraries(locktest PRIVATE Threads::Threads)
+
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(lockbench PRIVATE -march=native -fno-omit-frame-pointer)
   target_compile_options(indexbench PRIVATE -march=native -fno-omit-frame-pointer)
   target_compile_options(arraybench PRIVATE -march=native -fno-omit-frame-pointer)
+  target_compile_options(locktest PRIVATE -march=native -fno-omit-frame-pointer)
 endif()

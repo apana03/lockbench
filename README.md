@@ -49,6 +49,15 @@ pure lock contention patterns across the array.
 Concurrent hash table with per-bucket locking. Supports uniform and Zipfian key
 distributions. Operations: get, put, delete with configurable ratios.
 
+### locktest
+
+Correctness tests for all lock implementations. Verifies mutual exclusion by
+having N threads perform non-atomic increments (read → write) of a shared
+counter inside a critical section, then asserting `counter == threads * loops`.
+Tests TAS, TTAS, CAS, Ticket via `lock()`/`unlock()`, and RW/OCC via
+`write_lock()`/`write_unlock()`. RCU is excluded since it doesn't provide
+mutual exclusion over a shared counter.
+
 ## How Measurements Work
 
 ### Timing Model
@@ -150,6 +159,12 @@ cmake --build build
 
 # concurrent hash index (Zipfian skew)
 ./build/indexbench --lock occ --dist zipfian --threads 8 --read_pct 80 --insert_pct 10
+
+# correctness tests (all locks)
+./build/locktest
+
+# correctness test (specific lock, custom params)
+./build/locktest --lock ticket --threads 8 --loops 200000
 ```
 
 ## Sweep Scripts
@@ -204,6 +219,14 @@ Produces individual files per lock function (e.g. `asm/tas_lock.s`, `asm/occ_rea
 | `--read_pct` | read % for rw/occ locks | 80 |
 | `--csv` | append results as CSV to file | — |
 
+### locktest
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--lock` | `tas\|ttas\|cas\|ticket\|rw\|occ` | all |
+| `--threads` | worker threads | hw_concurrency |
+| `--loops` | iterations per thread | 100000 |
+
 ### indexbench
 
 | Flag | Description | Default |
@@ -242,6 +265,7 @@ bench/
   main.cpp           lockbench entry point
   array_bench.cpp    arraybench entry point
   index_bench.cpp    indexbench entry point
+  lock_test.cpp      locktest entry point (correctness tests)
   lock_asm.cpp       source for assembly generation
 scripts/
   sweep.sh           raw lock sweep
