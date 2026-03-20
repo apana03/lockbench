@@ -22,6 +22,7 @@ struct params {
   int threads         = std::max(1u, std::thread::hardware_concurrency());
   std::uint64_t loops = 100000;
   std::string lock    = "";  // empty = run all
+  bool pin            = false;
 };
 
 static void usage() {
@@ -46,6 +47,7 @@ static params parse_args(int argc, char** argv) {
     if      (a == "--threads") p.threads = std::stoi(need("--threads"));
     else if (a == "--loops")   p.loops   = std::stoull(need("--loops"));
     else if (a == "--lock")    p.lock    = need("--lock");
+    else if (a == "--pin")     p.pin     = true;
     else if (a == "--help" || a == "-h") { usage(); std::exit(0); }
     else { std::cerr << "Unknown arg: " << a << "\n"; std::exit(2); }
   }
@@ -55,7 +57,7 @@ static params parse_args(int argc, char** argv) {
 
 // test mutual exclusion via non-atomic increment
 template <class Lock>
-bool test_mutex(const char* name, int threads, std::uint64_t loops) {
+bool test_mutex(const char* name, int threads, std::uint64_t loops, bool pin) {
   Lock lock;
   std::uint64_t counter = 0;
   start_barrier barrier(threads);
@@ -63,7 +65,8 @@ bool test_mutex(const char* name, int threads, std::uint64_t loops) {
   workers.reserve(threads);
 
   for (int t = 0; t < threads; ++t) {
-    workers.emplace_back([&] {
+    workers.emplace_back([&, t] {
+      setup_worker_thread(t, pin);
       barrier.arrive_and_wait();
       for (std::uint64_t i = 0; i < loops; ++i) {
         lock.lock();
@@ -86,7 +89,7 @@ bool test_mutex(const char* name, int threads, std::uint64_t loops) {
 }
 
 // test rw_lock in exclusive (write) mode
-bool test_rw_write(const char* name, int threads, std::uint64_t loops) {
+bool test_rw_write(const char* name, int threads, std::uint64_t loops, bool pin) {
   rw_lock lock;
   std::uint64_t counter = 0;
   start_barrier barrier(threads);
@@ -94,7 +97,8 @@ bool test_rw_write(const char* name, int threads, std::uint64_t loops) {
   workers.reserve(threads);
 
   for (int t = 0; t < threads; ++t) {
-    workers.emplace_back([&] {
+    workers.emplace_back([&, t] {
+      setup_worker_thread(t, pin);
       barrier.arrive_and_wait();
       for (std::uint64_t i = 0; i < loops; ++i) {
         lock.write_lock();
@@ -117,7 +121,7 @@ bool test_rw_write(const char* name, int threads, std::uint64_t loops) {
 }
 
 // test occ_lock in exclusive (write) mode
-bool test_occ_write(const char* name, int threads, std::uint64_t loops) {
+bool test_occ_write(const char* name, int threads, std::uint64_t loops, bool pin) {
   occ_lock lock;
   std::uint64_t counter = 0;
   start_barrier barrier(threads);
@@ -125,7 +129,8 @@ bool test_occ_write(const char* name, int threads, std::uint64_t loops) {
   workers.reserve(threads);
 
   for (int t = 0; t < threads; ++t) {
-    workers.emplace_back([&] {
+    workers.emplace_back([&, t] {
+      setup_worker_thread(t, pin);
       barrier.arrive_and_wait();
       for (std::uint64_t i = 0; i < loops; ++i) {
         lock.write_lock();
@@ -159,12 +164,12 @@ int main(int argc, char** argv) {
       all_ok &= fn();
   };
 
-  run("tas",    [&] { return test_mutex<tas_lock>("tas_lock", p.threads, p.loops); });
-  run("ttas",   [&] { return test_mutex<ttas_lock>("ttas_lock", p.threads, p.loops); });
-  run("cas",    [&] { return test_mutex<cas_lock>("cas_lock", p.threads, p.loops); });
-  run("ticket", [&] { return test_mutex<ticket_lock>("ticket_lock", p.threads, p.loops); });
-  run("rw",     [&] { return test_rw_write("rw_lock (write)", p.threads, p.loops); });
-  run("occ",    [&] { return test_occ_write("occ_lock (write)", p.threads, p.loops); });
+  run("tas",    [&] { return test_mutex<tas_lock>("tas_lock", p.threads, p.loops, p.pin); });
+  run("ttas",   [&] { return test_mutex<ttas_lock>("ttas_lock", p.threads, p.loops, p.pin); });
+  run("cas",    [&] { return test_mutex<cas_lock>("cas_lock", p.threads, p.loops, p.pin); });
+  run("ticket", [&] { return test_mutex<ticket_lock>("ticket_lock", p.threads, p.loops, p.pin); });
+  run("rw",     [&] { return test_rw_write("rw_lock (write)", p.threads, p.loops, p.pin); });
+  run("occ",    [&] { return test_occ_write("occ_lock (write)", p.threads, p.loops, p.pin); });
 
   std::cout << "\n" << (all_ok ? "ALL PASSED" : "SOME FAILED") << "\n";
   return all_ok ? 0 : 1;

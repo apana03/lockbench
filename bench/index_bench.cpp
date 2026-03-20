@@ -38,6 +38,7 @@ struct params {
   std::uint64_t key_range = 1'000'000; // key space [0, key_range)
   std::size_t prefill     = 500'000;   // pre-populate before benchmark
   std::string csv_file;
+  bool pin              = false;     // pin threads to cores (Linux only)
 };
 
 static void usage() {
@@ -79,6 +80,7 @@ static params parse_args(int argc, char** argv) {
     else if (a == "--key_range")  p.key_range     = std::stoull(need("--key_range"));
     else if (a == "--prefill")    p.prefill       = std::stoull(need("--prefill"));
     else if (a == "--csv")        p.csv_file      = need("--csv");
+    else if (a == "--pin")        p.pin           = true;
     else if (a == "--help" || a == "-h") { usage(); std::exit(0); }
     else { std::cerr << "Unknown arg: " << a << "\n"; std::exit(2); }
   }
@@ -146,14 +148,14 @@ static void print_result(const char* label, const params& p, double secs,
   }
 
   if (!p.csv_file.empty()) {
-    std::string header = "lock,dist,threads,buckets,key_range,read_pct,insert_pct,delete_pct,seconds,total_ops,gets,puts,removes,ops_s,ns_op,fairness_min,fairness_max,fairness_ratio";
+    std::string header = "lock;dist;threads;buckets;key_range;read_pct;insert_pct;delete_pct;total_ops;gets;puts;removes;ops_s;ns_op;fairness_min;fairness_max;fairness_ratio";
     std::ostringstream row;
-    row << label << "," << p.dist << "," << p.threads << ","
-        << p.num_buckets << "," << p.key_range << "," << p.read_pct << ","
-        << p.insert_pct << "," << delete_pct << "," << secs << ","
-        << total << "," << total_gets << "," << total_puts << ","
-        << total_rems << "," << static_cast<std::uint64_t>(ops_s) << ","
-        << ns_op << "," << mn << "," << mx << "," << fairness;
+    row << label << ";" << p.dist << ";" << p.threads << ";"
+        << p.num_buckets << ";" << p.key_range << ";" << p.read_pct << ";"
+        << p.insert_pct << ";" << delete_pct << ";"
+        << total << ";" << total_gets << ";" << total_puts << ";"
+        << total_rems << ";" << static_cast<std::uint64_t>(ops_s) << ";"
+        << fmt_double(ns_op) << ";" << mn << ";" << mx << ";" << fmt_double(fairness);
     csv_append(p.csv_file, header, row.str());
   }
 }
@@ -173,6 +175,7 @@ static void run_bench_common(const params& p, const char* label, Index& index,
 
   for (int t = 0; t < p.threads; ++t) {
     workers.emplace_back([&, t] {
+      setup_worker_thread(t, p.pin);
       barrier.arrive_and_wait();
 
       std::uint64_t local_gets = 0, local_puts = 0, local_rems = 0;

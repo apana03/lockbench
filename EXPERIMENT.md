@@ -25,7 +25,7 @@ The primitives studied are:
 
 | | ARM64 | x86_64 |
 |-----------|-------|--------|
-| CPU | Apple M3 Pro (11 cores) | <!-- TODO: fill in --> |
+| CPU | Apple M3 Pro (11 cores: 6P + 5E) | Intel Xeon E5-2650L v3 (2 × 12-core Haswell, HT on = 48 logical) |
 | Memory | 36 GB | <!-- TODO: fill in --> |
 | Compiler | Apple Clang 17.0.0, `-O3 -march=native` | <!-- TODO: fill in --> |
 | OS | macOS (Darwin 24.3.0) | <!-- TODO: fill in --> |
@@ -42,9 +42,41 @@ The x86_64 platform uses `lock`-prefixed instructions (`lock xchg`, `lock cmpxch
 - **Warmup**: 1 second before measurement (excluded from results).
 - **Measurement**: 3 seconds per configuration; reported as total ops and ns/op.
 - **Fairness**: Ratio of min to max per-thread operation count (1.0 = perfect).
-- **Runs**: Each configuration was run twice; tables report averages.
+- **Runs**: Each configuration is run multiple times (default 3); tables report averages.
 - Each thread runs a tight loop performing operations until a shared `stop` flag is
   set. Per-thread counts are accumulated after join.
+
+### Reproducibility
+
+Benchmark variance comes from different sources on each platform:
+
+**ARM64 (macOS, Apple M3 Pro)**:
+- The M3 Pro has 6 performance (P) cores and 5 efficiency (E) cores. Without
+  control, the OS scheduler may place benchmark threads on E-cores, causing
+  asymmetric throughput and high fairness variance between runs.
+- macOS does not support thread pinning on Apple Silicon
+  (`THREAD_AFFINITY_POLICY` is not implemented on arm64). CPU frequency is
+  firmware-managed with no userspace control.
+- **Mitigation**: All benchmark threads set QoS class `QOS_CLASS_USER_INITIATED`
+  via `pthread_set_qos_class_self_np()`, which biases the scheduler toward
+  P-cores. This reduces but does not eliminate variance.
+
+**x86_64 (Linux, Intel Xeon E5-2650L v3)**:
+- The Xeon is a 2-socket NUMA system (2 x 12-core Haswell, hyperthreading
+  enabled = 48 logical cores). Without pinning, threads may be placed across
+  sockets non-deterministically, causing cache line bouncing and variable
+  coherence latency.
+- **Mitigation**: The `--pin` flag enables `sched_setaffinity()` to pin each
+  thread to a sequential core ID (0, 1, 2, ...), filling one socket first.
+  CPU frequency is locked via `scripts/setup_cpu.sh` (sets `performance`
+  governor, disables turbo).
+
+**Expected variance** (with mitigations applied):
+- ARM64: throughput CoV ~5-15%, fairness CoV ~20-50% for unfair locks (TTAS, CAS, OCC)
+- x86_64 with `--pin` + frequency lock: throughput CoV < 5%
+- Ticket lock fairness is stable on both platforms (CoV < 1%) due to FIFO ordering
+
+Each configuration is run N times (default 3); tables report averages.
 
 ### Benchmarks
 

@@ -33,6 +33,7 @@ struct params {
   std::uint64_t cs_work  = 0;          // busy_work iterations inside CS
   int    read_pct        = 80;         // read/write split for rw/occ locks
   std::string csv_file;
+  bool pin              = false;     // pin threads to cores (Linux only)
 };
 
 static void usage() {
@@ -66,6 +67,7 @@ static params parse_args(int argc, char** argv) {
     else if (a == "--cs_work")    p.cs_work       = std::stoull(need("--cs_work"));
     else if (a == "--read_pct")   p.read_pct      = std::stoi(need("--read_pct"));
     else if (a == "--csv")        p.csv_file      = need("--csv");
+    else if (a == "--pin")        p.pin           = true;
     else if (a == "--help" || a == "-h") { usage(); std::exit(0); }
     else { std::cerr << "Unknown arg: " << a << "\n"; std::exit(2); }
   }
@@ -121,13 +123,13 @@ static void print_result(const char* lock_label, const params& p, double secs,
   }
 
   if (!p.csv_file.empty()) {
-    std::string header = "lock,threads,num_locks,cs_work,read_pct,seconds,total_ops,read_ops,write_ops,ops_s,ns_op,fairness_min,fairness_max,fairness_ratio";
+    std::string header = "lock;threads;num_locks;cs_work;read_pct;total_ops;read_ops;write_ops;ops_s;ns_op;fairness_min;fairness_max;fairness_ratio";
     std::ostringstream row;
-    row << lock_label << "," << p.threads << "," << p.num_locks << ","
-        << p.cs_work << "," << p.read_pct << "," << secs << ","
-        << total_ops << "," << read_ops << "," << write_ops << ","
-        << static_cast<std::uint64_t>(ops_s) << "," << ns_op << ","
-        << mn << "," << mx << "," << fairness;
+    row << lock_label << ";" << p.threads << ";" << p.num_locks << ";"
+        << p.cs_work << ";" << p.read_pct << ";"
+        << total_ops << ";" << read_ops << ";" << write_ops << ";"
+        << static_cast<std::uint64_t>(ops_s) << ";" << fmt_double(ns_op) << ";"
+        << mn << ";" << mx << ";" << fmt_double(fairness);
     csv_append(p.csv_file, header, row.str());
   }
 }
@@ -148,6 +150,7 @@ static void bench_lock_array(const params& p, const char* label) {
 
   for (int t = 0; t < p.threads; ++t) {
     workers.emplace_back([&, t] {
+      setup_worker_thread(t, p.pin);
       barrier.arrive_and_wait();
       std::mt19937_64 rng(t + 42);
       std::uniform_int_distribution<std::size_t> idx_dist(0, p.num_locks - 1);
@@ -200,6 +203,7 @@ static void bench_lock_array_rw(const params& p, const char* label) {
 
   for (int t = 0; t < p.threads; ++t) {
     workers.emplace_back([&, t] {
+      setup_worker_thread(t, p.pin);
       barrier.arrive_and_wait();
       std::mt19937_64 rng(t + 42);
       std::uniform_int_distribution<std::size_t> idx_dist(0, p.num_locks - 1);
@@ -268,6 +272,7 @@ static void bench_lock_array_occ(const params& p, const char* label) {
 
   for (int t = 0; t < p.threads; ++t) {
     workers.emplace_back([&, t] {
+      setup_worker_thread(t, p.pin);
       barrier.arrive_and_wait();
       std::mt19937_64 rng(t + 42);
       std::uniform_int_distribution<std::size_t> idx_dist(0, p.num_locks - 1);
