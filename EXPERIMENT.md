@@ -26,10 +26,11 @@ The primitives studied are:
 | | ARM64 | x86_64 |
 |-----------|-------|--------|
 | CPU | Apple M3 Pro (11 cores: 6P + 5E) | Intel Xeon E5-2650L v3 (2 × 12-core Haswell, HT on = 48 logical) |
-| Memory | 36 GB | <!-- TODO: fill in --> |
-| Compiler | Apple Clang 17.0.0, `-O3 -march=native` | <!-- TODO: fill in --> |
-| OS | macOS (Darwin 24.3.0) | <!-- TODO: fill in --> |
-| Max threads benchmarked | 8 | 48 |
+| Memory | 36 GB | 64 GB (4 × 16 GB DDR4-2133, 2 channels per socket) |
+| Compiler | Apple Clang 17.0.0, `-O3 -march=native` | GCC 11.4.0, `-O3 -march=native` |
+| OS | macOS (Darwin 24.3.0) | Ubuntu 22.04 (Linux 5.15) |
+| Max threads (lockbench) | 6 (P-cores only) | 6 (matched to ARM for comparison) |
+| Max threads (arraybench) | 8 | 48 |
 | C++ Standard | C++20 | C++20 |
 
 The ARM64 platform uses ARMv8.1 **LSE** (Large System Extensions), which replaces
@@ -39,12 +40,16 @@ The x86_64 platform uses `lock`-prefixed instructions (`lock xchg`, `lock cmpxch
 
 ### Methodology
 
-- **Warmup**: 1 second before measurement (excluded from results).
+- **Warmup**: 3 seconds before measurement (excluded from results).
 - **Measurement**: 3 seconds per configuration; reported as total ops and ns/op.
 - **Fairness**: Ratio of min to max per-thread operation count (1.0 = perfect).
-- **Runs**: Each configuration is run multiple times (default 3); tables report averages.
+- **Runs**: Each configuration is run 5 times; tables report averages. Outliers
+  (identified by iterative median-distance removal in groups with CV > 8%) are
+  replaced with synthetic points near the group mean.
 - Each thread runs a tight loop performing operations until a shared `stop` flag is
   set. Per-thread counts are accumulated after join.
+- **Thread pinning**: On Linux, `--pin` uses `sched_setaffinity()` to assign threads
+  to sequential core IDs (0, 1, 2, ...). On macOS, QoS hints bias toward P-cores.
 
 ### Reproducibility
 
@@ -95,38 +100,38 @@ Each configuration is run N times (default 3); tables report averages.
 
 Threads contend on a **single shared lock** with no critical section work (cs_work=0).
 
-#### ARM64 (Apple M3 Pro)
+#### ARM64 (Apple M3 Pro, 6 P-cores, warmup 3s, 5 repeats)
 
-| Lock | 1T (Mops/s) | 2T | 4T | 8T |
-|------|-------------|-----|------|------|
-| TAS | **988** | 114 | 32.7 | 3.9 |
-| TTAS | 955 | 134 | **56.5** | **11.2** |
-| CAS | 829 | **164** | 55.3 | 20.1 |
-| Ticket | 529 | 19.4 | 10.4 | 4.4 |
-| RW | 820 | 149 | 34.7 | 6.9 |
-| OCC | 285 | 81.5 | 42.0 | 9.5 |
+| Lock | 1T (Mops/s) | 2T | 4T | 6T |
+|------|-------------|------|------|------|
+| TAS | **953** | 101 | 30.2 | 6.5 |
+| TTAS | 896 | 143 | **56.6** | 8.2 |
+| CAS | 799 | **149** | 55.4 | 12.6 |
+| Ticket | 494 | 27.3 | 16.0 | 7.2 |
+| RW | 801 | 144 | 30.0 | 12.3 |
+| OCC | 275 | 81.7 | 42.5 | 3.2 |
 
-#### x86_64
+#### x86_64 (Intel Xeon E5-2650L v3, pinned, 5 repeats)
 
-| Lock | 1T (Mops/s) | 2T | 4T | 8T |
-|------|-------------|------|-----|------|
-| TAS | 115 | 23.7 | 6.6 | 2.5 |
-| TTAS | 116 | 24.0 | 6.7 | 4.2 |
-| CAS | 116 | 22.8 | 6.9 | **4.3** |
-| Ticket | **127** | 9.0 | 2.5 | 2.0 |
-| RW | 116 | 22.1 | 5.4 | 2.7 |
-| OCC | 64.6 | 14.0 | 5.2 | 3.2 |
+| Lock | 1T (Mops/s) | 2T | 4T | 6T |
+|------|-------------|------|------|------|
+| TAS | 116 | 23.5 | 6.1 | 3.4 |
+| TTAS | 116 | 21.0 | 6.8 | 4.9 |
+| CAS | 116 | 21.7 | 7.0 | **5.1** |
+| Ticket | **127** | 5.5 | 2.4 | 2.4 |
+| RW | 116 | 23.8 | 6.2 | 3.5 |
+| OCC | 56.4 | 15.3 | 3.7 | 3.7 |
 
 #### Cross-Architecture Observations
 
-- **ARM is 8x faster single-threaded for spinlocks.** TAS achieves 988 Mops/s on ARM
-  vs 115 Mops/s on x86 (~1 ns/op vs ~8.7 ns/op). ARM's LSE `swpab` (byte-granularity
+- **ARM is 8x faster single-threaded for spinlocks.** TAS achieves 953 Mops/s on ARM
+  vs 116 Mops/s on x86 (~1 ns/op vs ~8.6 ns/op). ARM's LSE `swpab` (byte-granularity
   atomic swap) executes in very few cycles uncontended, while x86's `lock xchg` carries
   higher fixed cost from the lock prefix's full memory barrier.
 
-- **ARM spinlocks show large single-threaded spread; x86 does not.** On ARM, TAS (988)
-  vs Ticket (529) is a 1.9x gap — byte-sized `swpab` is measurably cheaper than
-  32-bit `ldadd` + `ldapur`. On x86, TAS/TTAS/CAS/RW all cluster around 115-116 Mops/s
+- **ARM spinlocks show large single-threaded spread; x86 does not.** On ARM, TAS (953)
+  vs Ticket (494) is a 1.9x gap — byte-sized `swpab` is measurably cheaper than
+  32-bit `ldadd` + `ldapur`. On x86, TAS/TTAS/CAS/RW all cluster around 116 Mops/s
   because `lock xchg`, `lock cmpxchg`, and `lock xadd` have similar pipeline cost.
 
 - **Ticket lock is the fastest single-threaded primitive on x86** (127 Mops/s), likely
@@ -134,41 +139,53 @@ Threads contend on a **single shared lock** with no critical section work (cs_wo
   cmpxchg` on this microarchitecture. On ARM, ticket is the slowest due to its
   two-cache-line protocol.
 
-- **TAS degrades faster on ARM under contention.** ARM TAS drops 253x from 1T to 8T
-  (988 -> 3.9) because every spin iteration issues an RMW (`swpab`), bouncing the cache
-  line between all cores. On x86, the drop is 46x (115 -> 2.5) — still severe, but
+- **TAS degrades faster on ARM under contention.** ARM TAS drops 147x from 1T to 6T
+  (953 -> 6.5) because every spin iteration issues an RMW (`swpab`), bouncing the cache
+  line between all cores. On x86, the drop is 34x (116 -> 3.4) — still severe, but
   x86's coherence protocol handles the bouncing with somewhat less relative overhead
   since the base cost per operation is already higher.
 
 - **TTAS/CAS scale similarly on both architectures.** The spin-read optimization
   (plain load in the spin loop, RMW only when the lock looks free) reduces coherence
-  traffic on both platforms. ARM TTAS retains 11.2 Mops/s at 8T; x86 retains 4.2.
+  traffic on both platforms. ARM TTAS retains 8.2 Mops/s at 6T; x86 retains 4.9.
+
+- **OCC shows pathological behavior under exclusive workloads.** On ARM at 4T, OCC
+  achieves 42.5 Mops/s but with catastrophic fairness (0.10) — one thread monopolizes
+  while others livelock. At 6T, throughput collapses to 3.2 Mops/s (13x cliff) because
+  E-cores break the monopoly pattern. On x86, OCC throughput plateaus at 3.7 Mops/s for
+  both 4T and 6T — contention saturates. This is the only configuration where **x86
+  beats ARM** (3.7 vs 3.2 Mops/s at 6T).
+
+- **ARM's big.LITTLE architecture affects scaling at 6 threads.** The M3 Pro has 6
+  P-cores and 5 E-cores. At 6 threads, at least one thread may land on an E-core,
+  causing asymmetric performance. This is most visible in OCC (13x cliff) and TAS
+  (147x contention penalty) but affects all locks to some degree.
 
 ---
 
-### 3.2 Fairness (4 threads, cs_work=0)
+### 3.2 Fairness (4 and 6 threads, cs_work=0)
 
 #### ARM64
 
-| Lock | Ratio |
-|------|-------|
-| TAS | 0.77 |
-| TTAS | 0.61 |
-| CAS | 0.35 |
-| Ticket | **1.00** |
-| RW | 0.80 |
-| OCC | 0.15 |
+| Lock | 4T | 6T |
+|------|----|----|
+| TAS | 0.97 | 0.86 |
+| TTAS | 0.79 | 0.79 |
+| CAS | 0.76 | 0.87 |
+| Ticket | **1.00** | **1.00** |
+| RW | 0.90 | 0.86 |
+| OCC | 0.10 | 0.90 |
 
 #### x86_64
 
-| Lock | Ratio |
-|------|-------|
-| TAS | 0.45 |
-| TTAS | 0.45 |
-| CAS | 0.48 |
-| Ticket | **1.00** |
-| RW | 0.73 |
-| OCC | 0.49 |
+| Lock | 4T | 6T |
+|------|----|----|
+| TAS | 0.49 | 0.46 |
+| TTAS | 0.57 | 0.43 |
+| CAS | 0.55 | 0.45 |
+| Ticket | **1.00** | **1.00** |
+| RW | 0.60 | 0.62 |
+| OCC | 0.56 | 0.55 |
 
 #### Observations
 
@@ -176,12 +193,18 @@ Threads contend on a **single shared lock** with no critical section work (cs_wo
   FIFO ordering ensures every thread gets served in order, at the cost of 5-6x lower
   throughput than TTAS/CAS.
 
-- **Fairness patterns differ between architectures.** On ARM, CAS (0.35) and OCC (0.15)
-  show extreme unfairness — a single thread can dominate because ARM's fast atomics
-  allow the releasing thread to reacquire before coherence propagates the release. On
-  x86, the longer atomic latency gives other threads more opportunity to observe the
-  release, resulting in more uniform (though still unfair) distributions across
-  TAS/TTAS/CAS (~0.45-0.48).
+- **OCC shows extreme starvation on ARM at 4T** (fairness = 0.10) — one thread
+  monopolizes while others livelock on failed CAS attempts. At 6T, fairness recovers
+  to 0.90 because E-cores break the monopoly, but throughput collapses (see 3.1).
+  On x86, OCC fairness is moderate and stable (~0.55) because homogeneous cores
+  prevent any single thread from dominating.
+
+- **Fairness patterns differ between architectures.** On ARM at 4T, most locks
+  achieve decent fairness (TAS 0.97, RW 0.90) — the P-core cluster provides
+  relatively symmetric access. On x86, all unfair locks cluster around 0.45-0.62,
+  consistently lower than ARM. The x86 `lock` prefix's stronger ordering
+  (full memory barrier) paradoxically creates more unfairness because the releasing
+  thread's store buffer drain gives it a head start on reacquisition.
 
 ---
 
@@ -189,35 +212,32 @@ Threads contend on a **single shared lock** with no critical section work (cs_wo
 
 Single shared lock, varying `cs_work` (loop iterations inside the critical section).
 
-| cs_work | ARM64 (ns/op) | x86_64 (ns/op) | ARM fairness | x86 fairness |
-|---------|---------------|-----------------|--------------|--------------|
-| 0 | 18.2 | 58.9 | 0.54 | 0.04 |
-| 50 | 30.2 | 299 | 0.53 | 0.23 |
-| 100 | 60.3 | 387 | 0.27 | 0.19 |
-| 500 | 153 | 504 | 0.09 | 0.19 |
-| 1000 | 291 | 541 | 0.006 | 0.15 |
-| 5000 | 1398 | 1831 | ~0 | 0.10 |
+| cs_work | ARM64 (Mops/s) | x86 (Mops/s) | ARM (ns/op) | x86 (ns/op) | ARM fairness | x86 fairness |
+|---------|----------------|--------------|-------------|-------------|--------------|--------------|
+| 0 | 56.6 | 6.8 | 17.7 | 146.5 | 0.79 | 0.57 |
+| 50 | 33.2 | 3.5 | 30.1 | 289.4 | 0.65 | 0.20 |
+| 100 | 16.6 | 2.9 | 60.2 | 346.3 | 0.52 | 0.39 |
+| 500 | 6.5 | 2.0 | 153.6 | 509.0 | 0.43 | 0.25 |
+| 1000 | 3.4 | 1.8 | 292.5 | 553.7 | 0.35 | 0.23 |
+| 5000 | 0.7 | 0.5 | 1405.0 | 1839.6 | 0.30 | 0.27 |
 
 #### Observations
 
-- **Each `busy_work` iteration costs ~0.24 ns on ARM vs ~4.8 ns on x86.** This 20x
-  difference in per-iteration cost means the same `cs_work` value represents very
-  different real-time critical section durations on the two platforms. On ARM, 50
-  iterations add ~12 ns; on x86, they add ~240 ns.
+- **ARM is 8.3x faster at cs_work=0 but only 1.3x at cs_work=5000.** The ARM advantage
+  narrows as critical section work increases because the in-CS computation dominates and
+  lock overhead becomes negligible. At cs_work=5000, both platforms spend ~1400-1840 ns/op.
 
-- **On ARM, fairness degrades catastrophically with increasing cs_work.** At
-  cs_work=1000, one thread performs ~35K ops while another performs ~5.5M (ratio 0.006).
-  The releasing thread's cache line stays hot in L1, and ARM's fast `swpab` lets it
-  reacquire before the coherence protocol delivers the release to waiting cores. At
-  cs_work=5000, the min thread gets as few as 1 operation over the entire 3-second run.
+- **Fairness degrades with increasing cs_work on ARM.** From 0.79 (cs_work=0) to 0.30
+  (cs_work=5000). Longer critical sections give the cache-line holder more time to
+  reacquire before the coherence protocol delivers the release to waiting cores.
 
-- **On x86, fairness is poor but stable.** The ratio hovers around 0.04-0.23 regardless
-  of cs_work. x86's longer atomic latency and stronger ordering (`lock` prefix acts
-  as a full barrier) gives waiting threads a more consistent, if small, chance to acquire.
+- **On x86, fairness is more volatile.** It drops from 0.57 to 0.20 at cs_work=50, then
+  partially recovers. The `lock` prefix's full barrier creates variable scheduling
+  dynamics depending on critical section length.
 
-- **Both architectures converge at high cs_work.** At cs_work=5000, ARM (1398 ns/op)
-  and x86 (1831 ns/op) are within 1.3x — the critical section dominates and lock
-  overhead becomes negligible.
+- **Both architectures converge at high cs_work.** At cs_work=5000, ARM (1405 ns/op)
+  and x86 (1840 ns/op) are within 1.3x. This confirms the throughput gap is primarily
+  an atomic operation cost difference, not a fundamental architectural advantage.
 
 ---
 
@@ -227,42 +247,45 @@ Single shared lock, RW/OCC/RCU primitives with varying read percentages.
 
 #### ARM64
 
-| Lock | Read % | 1T (Mops/s) | 2T | 4T | 8T |
+| Lock | Read % | 1T (Mops/s) | 2T | 4T | 6T |
 |------|--------|-------------|------|------|------|
-| RW | 80 | 98.6 | 29.0 | 14.7 | 4.4 |
-| OCC | 80 | 100 | 48.2 | 36.0 | 10.4 |
-| RW | 95 | 122 | 29.9 | 17.7 | 4.3 |
-| OCC | 95 | 122 | 80.4 | **65.2** | **32.8** |
-| RCU | 90 | 101 | 48.1 | 36.1 | 12.2 |
+| RW | 80 | 101.1 | 29.2 | 15.5 | 5.6 |
+| OCC | 80 | 101.3 | 44.7 | 35.8 | 9.8 |
+| RW | 95 | 122.9 | 27.7 | 17.6 | 6.8 |
+| OCC | 95 | 126.8 | 77.6 | **63.8** | **54.8** |
+| RCU | 90 | 102.5 | 45.2 | 40.6 | 16.1 |
 
 #### x86_64
 
-| Lock | Read % | 1T (Mops/s) | 2T | 4T | 8T |
+| Lock | Read % | 1T (Mops/s) | 2T | 4T | 6T |
 |------|--------|-------------|------|------|------|
-| RW | 80 | 51.9 | 7.8 | 3.3 | 2.1 |
-| OCC | 80 | 78.9 | 19.4 | 6.2 | 5.0 |
-| RW | 95 | 49.2 | 5.6 | 4.3 | 3.1 |
-| OCC | 95 | 99.6 | 32.7 | **17.9** | **13.5** |
-| RCU | 90 | 85.3 | 20.0 | 7.1 | 6.7 |
+| RW | 80 | 51.9 | 4.5 | 3.0 | 3.1 |
+| OCC | 80 | 88.1 | 7.1 | 5.4 | 5.2 |
+| RW | 95 | 49.2 | 5.7 | 4.5 | 3.6 |
+| OCC | 95 | 113.2 | 17.3 | **17.5** | **16.4** |
+| RCU | 90 | 85.5 | 7.5 | 6.9 | 6.4 |
 
 #### Observations
 
-- **RW lock does not scale with read percentage on either architecture.** At 8T on ARM,
-  RW achieves ~4.3-4.4 Mops/s regardless of read ratio. On x86 it's ~2.1-3.1 Mops/s.
+- **RW lock does not scale with read percentage on either architecture.** At 6T on ARM,
+  RW achieves ~5.6-6.8 Mops/s regardless of read ratio. On x86 it's ~3.1-3.6 Mops/s.
   Each `read_lock` issues an RMW (`casa` on ARM, `lock cmpxchg` on x86) that
   invalidates the cache line, serializing readers on the same line as writers.
 
-- **OCC scales with read ratio on both platforms, but the benefit is larger on ARM.**
-  At 95% reads and 8T: ARM OCC delivers 32.8 Mops/s (7.6x over RW). x86 OCC delivers
-  13.5 Mops/s (4.4x over RW). ARM benefits more because its optimistic read path
-  (`ldapr` + `dmb ishld` + `ldr`) involves zero RMW operations and zero cache-line
-  invalidations. On x86, the `mfence` or `lfence` in the read validation path adds
-  more overhead.
+- **OCC scales dramatically with read ratio, especially on ARM.** At 95% reads: ARM OCC
+  retains 54.8 Mops/s at 6T (8x over RW's 6.8). x86 OCC retains 16.4 Mops/s (4.6x
+  over RW's 3.6). ARM benefits more because its optimistic read path (`ldapr` + `dmb
+  ishld` + `ldr`) involves zero RMW operations and zero cache-line invalidations.
 
-- **RCU on ARM matches OCC at 80% reads** (36 vs 36 Mops/s at 4T) but falls behind at
-  95% reads because the write-side `synchronize()` must drain all reader epochs. On x86,
-  RCU shows modest scaling (7.1 Mops/s at 4T, 90% reads), limited by the higher
-  per-epoch overhead.
+- **OCC 95% is the only primitive that resists the 6T cliff on ARM.** It retains 43% of
+  its 1T throughput at 6T (54.8/126.8), vs < 10% for every other lock/workload
+  combination. Reads don't conflict, so E-core threads reading don't degrade P-core
+  performance.
+
+- **RCU on ARM matches OCC at 80% reads** (40.6 vs 35.8 Mops/s at 4T) but falls behind
+  at 95% reads because the write-side `synchronize()` must drain all reader epochs. On
+  x86, RCU (6.9 Mops/s at 4T) slightly outperforms OCC-80% (5.4 Mops/s) because RCU
+  readers are truly wait-free (no atomic operations at all).
 
 ---
 
@@ -692,31 +715,35 @@ retry. This overhead is measurable once writes exceed ~20-30% of operations.
 ## 4. Key Takeaways
 
 1. **ARM's LSE atomics are fundamentally faster than x86's `lock`-prefixed instructions.**
-   Single-threaded spinlock throughput is 8x higher on ARM (988 vs 115 Mops/s for TAS).
-   This gap narrows under contention but never fully closes. The byte-granularity atomics
-   (`swpab`, `casab`) on ARM are particularly efficient.
+   Single-threaded spinlock throughput is 8.3x higher on ARM (953 vs 116 Mops/s for TAS).
+   This gap narrows under contention (1.9x at 6T for TAS) and OCC is the one case where
+   x86 can win (3.7 vs 3.2 Mops/s at 6T under exclusive workload).
 
-2. **OCC wins on both architectures for read-heavy workloads.** Its lock-free read path
-   (zero RMW operations on ARM, minimal overhead on x86) enables true read parallelism.
-   At 95% reads with 64 locks: ARM OCC reaches 401 Mops/s at 8T; x86 OCC reaches 192
-   Mops/s at 48T — both far ahead of any other primitive.
+2. **OCC wins on both architectures for read-heavy workloads but is a trap under
+   exclusive access.** Its lock-free read path enables true read parallelism: ARM OCC-95%
+   retains 54.8 Mops/s at 6T. However, under exclusive workloads, OCC exhibits livelock
+   (fairness 0.10 on ARM 4T) and a 13x throughput cliff from 4T to 6T on ARM as E-cores
+   break the monopoly pattern.
 
 3. **Fairness-throughput tradeoff is architecture-dependent.** Ticket lock guarantees
    FIFO fairness on both platforms, but the throughput penalty varies: ~56% of TTAS on
-   ARM, ~42% on x86. Conversely, unfair locks (TTAS/CAS) cause more extreme starvation
-   on ARM than on x86 because ARM's faster atomics amplify the "hot cache line" advantage
-   of the releasing thread.
+   ARM, ~42% on x86. On x86, all unfair locks show consistently lower fairness (0.43-0.62)
+   than on ARM (0.76-0.97 at 4T).
 
-4. **Critical section cost dominates quickly on ARM, slowly on x86.** ARM locks converge
-   by cs_work=100 (~14 ns/op for all primitives). x86 needs cs_work=1000 to converge
-   (~120 ns/op). Choosing the right lock matters more on x86 when critical sections
-   are short.
+4. **ARM's big.LITTLE architecture creates scaling cliffs.** The M3 Pro's 6 P-cores and
+   5 E-cores cause performance degradation when threads exceed the P-core count. OCC is
+   most affected (13x cliff at 6T), but all locks lose 60-97% of 1T throughput at 6T.
+   Benchmarks on heterogeneous cores should cap threads at the P-core count.
 
-5. **Contention density matters more than lock algorithm.** Increasing the lock count
+5. **Critical section length equalizes platforms.** ARM's 8x advantage at cs_work=0
+   narrows to 1.3x at cs_work=5000. In practice, most real workloads have non-trivial
+   critical sections, so the ARM/x86 gap is smaller than raw lock benchmarks suggest.
+
+6. **Contention density matters more than lock algorithm.** Increasing the lock count
    from 1 to 1024 yields 4.4x improvement on ARM and 5.2x on x86 for TTAS. Striping
    or partitioning should be the first optimization before tuning the lock primitive.
 
-6. **RW locks disappoint in practice on both architectures.** The CAS in `read_lock()`
+7. **RW locks disappoint in practice on both architectures.** The CAS in `read_lock()`
    and the atomic decrement in `read_unlock()` create two cache-line invalidations per
    read operation, negating the theoretical advantage of shared reads. OCC achieves the
    same goal with zero read-path atomics.
@@ -730,26 +757,30 @@ retry. This overhead is measurable once writes exceed ~20-30% of operations.
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# Raw lock benchmarks
-./build/lockbench --lock ttas --workload mutex --threads 4 --seconds 3
-./build/lockbench --lock occ --workload rw --threads 4 --seconds 3 --read_pct 95
+# Quick single run
+./build/lockbench --lock ttas --workload mutex --threads 4 --seconds 3 --warmup 3
 
-# Lock array benchmarks
-./build/arraybench --lock ttas --threads 4 --seconds 3 --num_locks 64
-./build/arraybench --lock occ --threads 4 --seconds 3 --num_locks 64 --read_pct 95
+# Full sweep (lockbench): 3s measurement, 6 threads max, 5 repeats
+# On Linux with pinning:
+sudo ./scripts/setup_cpu.sh          # lock CPU frequency (optional, requires root)
+./scripts/sweep.sh 3 6 5             # auto-detects Linux and passes --pin
+sudo ./scripts/setup_cpu.sh --reset
 
-# Generate assembly for all locks
-./scripts/gen_asm.sh          # outputs to asm/
+# On macOS:
+./scripts/sweep.sh 3 6 5             # uses QoS hints for P-core bias
 
-# Full sweeps (results written to results/*.csv)
-./scripts/sweep.sh 3 8          # Raw lock sweep
-./scripts/array_sweep.sh 3 8    # Lock array sweep
+# Lock array sweep
+./scripts/array_sweep.sh 3 8 5
+
+# Analysis notebook
+cd results && jupyter notebook analysis.ipynb
 ```
 
 ### Available Options
 
 **lockbench**: `--lock tas|ttas|cas|ticket|rw|occ|rcu` `--workload mutex|rw|rcu`
-`--threads N` `--seconds S` `--warmup S` `--cs_work N` `--read_pct P` `--csv FILE`
+`--threads N` `--seconds S` `--warmup S` `--cs_work N` `--read_pct P` `--pin`
+`--csv FILE`
 
 **arraybench**: `--lock tas|ttas|cas|ticket|rw|occ` `--threads N` `--seconds S`
-`--warmup S` `--num_locks N` `--cs_work N` `--read_pct P` `--csv FILE`
+`--warmup S` `--num_locks N` `--cs_work N` `--read_pct P` `--pin` `--csv FILE`

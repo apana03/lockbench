@@ -16,5 +16,13 @@ asm/
 # OS
 .DS_Store
 
+# Python venv
+.venv/
+results/.venv/
+__pycache__/
+
+# Generated plots (regenerate from results/analysis.ipynb)
+results/plot*.png
+
 # Local Claude Code instructions (never push)
 CLAUDE.md

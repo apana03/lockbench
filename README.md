@@ -171,13 +171,25 @@ cmake --build build
 
 ```bash
 # raw lock sweep across thread counts (results → results/lockbench.csv)
-./scripts/sweep.sh [seconds] [max_threads]
+./scripts/sweep.sh [seconds] [max_threads] [repeats]
 
 # index benchmark sweep (results → results/indexbench.csv)
-./scripts/index_sweep.sh [seconds] [max_threads]
+./scripts/index_sweep.sh [seconds] [max_threads] [repeats]
 
 # array benchmark sweep (results → results/arraybench.csv)
-./scripts/array_sweep.sh [seconds] [max_threads]
+./scripts/array_sweep.sh [seconds] [max_threads] [repeats]
+
+# example: 3s measurement, 6 threads max, 5 repeats
+./scripts/sweep.sh 3 6 5
+```
+
+On Linux, sweep scripts auto-detect the platform and pass `--pin` to each run.
+For best reproducibility on Linux, lock the CPU frequency first:
+
+```bash
+sudo ./scripts/setup_cpu.sh            # set performance governor, disable turbo
+./scripts/sweep.sh 3 6 5
+sudo ./scripts/setup_cpu.sh --reset    # restore defaults
 ```
 
 ## Assembly
@@ -204,6 +216,7 @@ Produces individual files per lock function (e.g. `asm/tas_lock.s`, `asm/occ_rea
 | `--warmup` | warmup duration | 1 |
 | `--cs_work` | busy-work loop iterations inside critical section | 0 |
 | `--read_pct` | read % for rw/rcu workloads | 80 |
+| `--pin` | pin threads to cores (Linux: `sched_setaffinity`, macOS: QoS hint) | off |
 | `--csv` | append results as CSV to file | — |
 
 ### arraybench
@@ -217,6 +230,7 @@ Produces individual files per lock function (e.g. `asm/tas_lock.s`, `asm/occ_rea
 | `--num_locks` | number of locks in the array | 64 |
 | `--cs_work` | busy-work loop iterations inside critical section | 0 |
 | `--read_pct` | read % for rw/occ locks | 80 |
+| `--pin` | pin threads to cores (Linux: `sched_setaffinity`, macOS: QoS hint) | off |
 | `--csv` | append results as CSV to file | — |
 
 ### locktest
@@ -242,6 +256,7 @@ Produces individual files per lock function (e.g. `asm/tas_lock.s`, `asm/occ_rea
 | `--buckets` | hash table buckets (power of 2) | 65536 |
 | `--key_range` | key space size | 1000000 |
 | `--prefill` | keys to pre-insert | 500000 |
+| `--pin` | pin threads to cores (Linux: `sched_setaffinity`, macOS: QoS hint) | off |
 | `--csv` | append results as CSV to file | — |
 
 ## Project Structure
@@ -272,10 +287,25 @@ scripts/
   index_sweep.sh     index benchmark sweep
   array_sweep.sh     array benchmark sweep
   gen_asm.sh         generate assembly files
-EXPERIMENT.md        detailed results and analysis
+  setup_cpu.sh       Linux CPU frequency locking (requires root)
+results/
+  combined_lockbench.csv      ARM + x86 lockbench results (5 repeats, 6 threads max)
+  optimized_arm_lockbench.csv raw ARM sweep output
+  optimized_x86_lockbench.csv raw x86 sweep output
+  analysis.ipynb              Jupyter notebook with all plots and analysis
+EXPERIMENT.md                 detailed results and analysis
 ```
 
 ## Results
 
 See [EXPERIMENT.md](EXPERIMENT.md) for detailed benchmark results, cross-architecture
 comparisons (ARM64 vs x86_64), and assembly analysis.
+
+To reproduce the analysis plots:
+
+```bash
+cd results
+python3 -m venv .venv && source .venv/bin/activate
+pip install ipykernel pandas matplotlib numpy
+jupyter notebook analysis.ipynb
+```
