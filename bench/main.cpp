@@ -213,6 +213,7 @@ static void bench_rw(const params& p, const char* label) {
       barrier.arrive_and_wait();
       std::mt19937 rng(t + 42);
       std::uniform_int_distribution<int> dist(0, 99);
+      std::uint64_t local_reads = 0, local_writes = 0;
 
       while (!stop.load(std::memory_order_relaxed)) {
         if (dist(rng) < p.read_pct) {
@@ -220,15 +221,17 @@ static void bench_rw(const params& p, const char* label) {
           if (p.cs_work) busy_work(p.cs_work);
           volatile std::uint64_t sink = shared_data; (void)sink;
           lock.read_unlock();
-          if (measuring.load(std::memory_order_relaxed)) ++stats[t].reads;
+          if (measuring.load(std::memory_order_relaxed)) ++local_reads;
         } else {
           lock.write_lock();
           if (p.cs_work) busy_work(p.cs_work);
           ++shared_data;
           lock.write_unlock();
-          if (measuring.load(std::memory_order_relaxed)) ++stats[t].writes;
+          if (measuring.load(std::memory_order_relaxed)) ++local_writes;
         }
       }
+      stats[t].reads  = local_reads;
+      stats[t].writes = local_writes;
     });
   }
 
@@ -265,7 +268,11 @@ static void bench_occ_rw(const params& p, const char* label) {
   std::atomic<bool> measuring{false};
   start_barrier barrier(p.threads);
 
-  alignas(64) std::uint64_t shared_data = 0;
+  // must be atomic to avoid data-race UB in the C++ memory model:
+  // readers load shared_data speculatively (before validation), so a
+  // concurrent writer store is a data race on plain uint64_t.
+  // relaxed ordering is sufficient - the occ_lock fences provide ordering.
+  alignas(64) std::atomic<std::uint64_t> shared_data{0};
 
   struct thread_stats { std::uint64_t reads = 0; std::uint64_t writes = 0; };
   std::vector<thread_stats> stats(p.threads);
@@ -278,26 +285,30 @@ static void bench_occ_rw(const params& p, const char* label) {
       barrier.arrive_and_wait();
       std::mt19937 rng(t + 42);
       std::uniform_int_distribution<int> dist(0, 99);
+      std::uint64_t local_reads = 0, local_writes = 0;
 
       while (!stop.load(std::memory_order_relaxed)) {
         if (dist(rng) < p.read_pct) {
           std::uint64_t val;
           do {
             auto v = lock.read_begin();
-            val = shared_data;
+            val = shared_data.load(std::memory_order_relaxed);
             if (p.cs_work) busy_work(p.cs_work);
             if (lock.read_validate(v)) break;
           } while (true);
           volatile std::uint64_t sink = val; (void)sink;
-          if (measuring.load(std::memory_order_relaxed)) ++stats[t].reads;
+          if (measuring.load(std::memory_order_relaxed)) ++local_reads;
         } else {
           lock.write_lock();
           if (p.cs_work) busy_work(p.cs_work);
-          ++shared_data;
+          shared_data.store(shared_data.load(std::memory_order_relaxed) + 1,
+                            std::memory_order_relaxed);
           lock.write_unlock();
-          if (measuring.load(std::memory_order_relaxed)) ++stats[t].writes;
+          if (measuring.load(std::memory_order_relaxed)) ++local_writes;
         }
       }
+      stats[t].reads  = local_reads;
+      stats[t].writes = local_writes;
     });
   }
 
@@ -351,6 +362,7 @@ static void bench_rcu(const params& p, const char* label) {
       std::mt19937 rng(t + 42);
       std::uniform_int_distribution<int> dist(0, 99);
 
+      std::uint64_t local_reads = 0, local_writes = 0;
       while (!stop.load(std::memory_order_relaxed)) {
         if (dist(rng) < p.read_pct) {
           rcu.read_lock(t);
@@ -358,7 +370,7 @@ static void bench_rcu(const params& p, const char* label) {
           volatile std::uint64_t sink = *ptr; (void)sink;
           if (p.cs_work) busy_work(p.cs_work);
           rcu.read_unlock(t);
-          if (measuring.load(std::memory_order_relaxed)) ++stats[t].reads;
+          if (measuring.load(std::memory_order_relaxed)) ++local_reads;
         } else {
           writer_lock.lock();
           std::uint64_t* old = data_ptr.load(std::memory_order_relaxed);
@@ -368,9 +380,11 @@ static void bench_rcu(const params& p, const char* label) {
           delete old;
           if (p.cs_work) busy_work(p.cs_work);
           writer_lock.unlock();
-          if (measuring.load(std::memory_order_relaxed)) ++stats[t].writes;
+          if (measuring.load(std::memory_order_relaxed)) ++local_writes;
         }
       }
+      stats[t].reads  = local_reads;
+      stats[t].writes = local_writes;
     });
   }
 

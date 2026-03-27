@@ -35,9 +35,11 @@ struct occ_lock {
   }
 
   // check if version is still the same - if not, a write happened and we need to retry
+  // the acquire fence ensures the data load completes before we re-check the version
+  // the acquire load ensures we observe the writer's release store (write_unlock)
   bool read_validate(std::uint64_t start_version) const noexcept {
     std::atomic_thread_fence(std::memory_order_acquire);
-    return version.load(std::memory_order_relaxed) == start_version;
+    return version.load(std::memory_order_acquire) == start_version;
   }
 
   // for the mutex benchmarks
