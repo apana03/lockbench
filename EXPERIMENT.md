@@ -773,7 +773,7 @@ sudo ./scripts/setup_cpu.sh --reset
 ./scripts/array_sweep.sh 3 8 5
 
 # Analysis notebook
-cd results && jupyter notebook analysis.ipynb
+cd results && jupyter notebook presentation_notebook.ipynb
 ```
 
 ### Available Options

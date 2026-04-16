@@ -289,10 +289,10 @@ scripts/
   gen_asm.sh         generate assembly files
   setup_cpu.sh       Linux CPU frequency locking (requires root)
 results/
-  combined_lockbench.csv      ARM + x86 lockbench results (5 repeats, 6 threads max)
-  optimized_arm_lockbench.csv raw ARM sweep output
-  optimized_x86_lockbench.csv raw x86 sweep output
-  analysis.ipynb              Jupyter notebook with all plots and analysis
+  arm_xgene1_lockbench.csv    X-Gene 1 (ARMv8) lockbench sweep results
+  x86_xeon_lockbench.csv      Intel Xeon (x86_64) lockbench sweep results
+  presentation_notebook.ipynb current ARM vs x86 comparison plots
+  archive/                    earlier sweeps and notebooks kept for reference
 EXPERIMENT.md                 detailed results and analysis
 ```
 
@@ -307,5 +307,5 @@ To reproduce the analysis plots:
 cd results
 python3 -m venv .venv && source .venv/bin/activate
 pip install ipykernel pandas matplotlib numpy
-jupyter notebook analysis.ipynb
+jupyter notebook presentation_notebook.ipynb
 ```

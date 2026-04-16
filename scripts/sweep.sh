@@ -41,7 +41,7 @@ done
 
 echo "=== Read-sensitive locks: thread sweep (rw, occ, rcu × 0/50/100% reads) ==="
 for lock in rw occ; do
-  for read_pct in 0 50 100; do
+  for read_pct in 0 50 80 95 100; do
     for t in 1 2 4 6 8 $(seq 16 16 "$MAX_THREADS" 2>/dev/null); do
       [ "$t" -gt "$MAX_THREADS" ] && continue
       for r in $(seq 1 "$REPEATS"); do
@@ -52,7 +52,7 @@ for lock in rw occ; do
   echo ""
 done
 
-for read_pct in 0 50 100; do
+for read_pct in 0 50 80 95 100; do
   for t in 1 2 4 6 8 $(seq 16 16 "$MAX_THREADS" 2>/dev/null); do
     [ "$t" -gt "$MAX_THREADS" ] && continue
     for r in $(seq 1 "$REPEATS"); do
