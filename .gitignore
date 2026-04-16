@@ -5,9 +5,7 @@ CMakeCache.txt
 cmake_install.cmake
 Makefile
 
-# Generated assembly (regenerate with ./scripts/gen_asm.sh)
 asm/
-*.s
 
 # IDE
 .vscode/
@@ -21,8 +19,6 @@ asm/
 results/.venv/
 __pycache__/
 
-# Generated plots (regenerate from results/analysis.ipynb)
 results/plot*.png
 
-# Local Claude Code instructions (never push)
 CLAUDE.md
