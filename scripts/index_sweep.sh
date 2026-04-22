@@ -8,7 +8,8 @@ SECONDS_PER_RUN=${1:-3}
 MAX_THREADS=${2:-$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 8)}
 REPEATS=${3:-3}
 BIN="./build/indexbench"
-CSV="results/indexbench.csv"
+OUT_DIR="results/indexbench"
+CSV="$OUT_DIR/indexbench.csv"
 
 PIN_FLAG=""
 [ "$(uname)" = "Linux" ] && PIN_FLAG="--pin"
@@ -18,7 +19,7 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-mkdir -p results
+mkdir -p "$OUT_DIR"
 rm -f "$CSV"
 
 THREAD_LIST="1 2 4 8"

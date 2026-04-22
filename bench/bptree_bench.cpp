@@ -1,4 +1,4 @@
-// indexbench - test locks on a concurrent hash table
+// bptreebench - test locks inside a per-node-locked B+ tree (crabbing).
 // supports uniform and zipfian key distributions
 
 #include <iostream>
@@ -10,12 +10,12 @@
 #include "../include/primitives/ticket_lock.hpp"
 #include "../include/primitives/rw_lock.hpp"
 #include "../include/primitives/occ.hpp"
-#include "../include/indexes/hash_index.hpp"
+#include "../include/indexes/bptree_index.hpp"
 #include "../include/util/bench_harness.hpp"
 
 template <class Lock>
-static void run_index_bench(const params& p, const char* label) {
-  hash_index<Lock> index(p.num_buckets);
+static void run_bptree_bench(const params& p, const char* label) {
+  bptree_index<Lock> index;
   prefill_index(index, p);
 
   run_bench_common(p, label, index,
@@ -24,9 +24,8 @@ static void run_index_bench(const params& p, const char* label) {
     [](auto& idx, std::uint64_t key) { idx.remove(key); });
 }
 
-// rw lock version - reads use shared lock instead of exclusive
-static void run_rw_index_bench(const params& p, const char* label) {
-  hash_index<rw_lock> index(p.num_buckets);
+static void run_rw_bptree_bench(const params& p, const char* label) {
+  bptree_index<rw_lock> index;
   prefill_index(index, p);
 
   run_bench_common(p, label, index,
@@ -35,9 +34,8 @@ static void run_rw_index_bench(const params& p, const char* label) {
     [](auto& idx, std::uint64_t key) { idx.remove(key); });
 }
 
-// OCC version - reads don't take a lock at all, just validate after
-static void run_occ_index_bench(const params& p, const char* label) {
-  hash_index<occ_lock> index(p.num_buckets);
+static void run_occ_bptree_bench(const params& p, const char* label) {
+  bptree_index<occ_lock> index;
   prefill_index(index, p);
 
   run_bench_common(p, label, index,
@@ -49,17 +47,17 @@ static void run_occ_index_bench(const params& p, const char* label) {
 int main(int argc, char** argv) {
   params p = parse_bench_args(argc, argv);
   if (p.lock_name == "rw") {
-    run_rw_index_bench(p, "rw");
+    run_rw_bptree_bench(p, "rw");
   } else if (p.lock_name == "occ") {
-    run_occ_index_bench(p, "occ");
+    run_occ_bptree_bench(p, "occ");
   } else if (p.lock_name == "tas") {
-    run_index_bench<tas_lock>(p, "tas");
+    run_bptree_bench<tas_lock>(p, "tas");
   } else if (p.lock_name == "ttas") {
-    run_index_bench<ttas_lock>(p, "ttas");
+    run_bptree_bench<ttas_lock>(p, "ttas");
   } else if (p.lock_name == "cas") {
-    run_index_bench<cas_lock>(p, "cas");
+    run_bptree_bench<cas_lock>(p, "cas");
   } else if (p.lock_name == "ticket") {
-    run_index_bench<ticket_lock>(p, "ticket");
+    run_bptree_bench<ticket_lock>(p, "ticket");
   } else {
     std::cerr << "Unsupported --lock " << p.lock_name
               << " (use tas|ttas|cas|ticket|rw|occ)\n";

@@ -30,9 +30,27 @@ add_executable(locktest bench/lock_test.cpp)
 target_include_directories(locktest PRIVATE include)
 target_link_libraries(locktest PRIVATE Threads::Threads)
 
+# --- skiplistbench: concurrent skip list with per-node locking ---
+add_executable(skiplistbench bench/skiplist_bench.cpp)
+target_include_directories(skiplistbench PRIVATE include)
+target_link_libraries(skiplistbench PRIVATE Threads::Threads)
+
+# --- bptreebench: concurrent B+ tree with crabbing ---
+add_executable(bptreebench bench/bptree_bench.cpp)
+target_include_directories(bptreebench PRIVATE include)
+target_link_libraries(bptreebench PRIVATE Threads::Threads)
+
+# --- indextest: correctness probe for skiplist + bptree ---
+add_executable(indextest bench/index_test.cpp)
+target_include_directories(indextest PRIVATE include)
+target_link_libraries(indextest PRIVATE Threads::Threads)
+
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(lockbench PRIVATE -march=native -fno-omit-frame-pointer)
   target_compile_options(indexbench PRIVATE -march=native -fno-omit-frame-pointer)
   target_compile_options(arraybench PRIVATE -march=native -fno-omit-frame-pointer)
   target_compile_options(locktest PRIVATE -march=native -fno-omit-frame-pointer)
+  target_compile_options(skiplistbench PRIVATE -march=native -fno-omit-frame-pointer)
+  target_compile_options(bptreebench   PRIVATE -march=native -fno-omit-frame-pointer)
+  target_compile_options(indextest     PRIVATE -march=native -fno-omit-frame-pointer)
 endif()

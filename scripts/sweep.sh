@@ -14,7 +14,8 @@ MAX_THREADS=${2:-$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || e
 REPEATS=${3:-5}
 CS_LOCK=${4:-}
 BIN="./build/lockbench"
-CSV="results/lockbench.csv"
+OUT_DIR="results/lockbench"
+CSV="$OUT_DIR/lockbench.csv"
 
 # auto-detect platform and pass --pin on Linux
 PIN_FLAG=""
@@ -25,7 +26,7 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-mkdir -p results
+mkdir -p "$OUT_DIR"
 rm -f "$CSV"
 
 echo "=== Mutex workload (exclusive lock/unlock) [repeats=$REPEATS] ==="
