@@ -10,8 +10,11 @@
 //   - deleted nodes are leaked (no epoch-based reclamation); this is what
 //     keeps the OCC read path safe (readers can always dereference any node
 //     they observe, even if it is logically deleted).
-//   - reads do hand-over-hand at level 0 only; upper levels are used only
-//     during write-side predecessor search.
+//
+// Memory ordering: next[] is std::atomic so unlocked readers (find(),
+// get_optimistic()) observe publishes without tearing. Writers publish a
+// freshly linked node with release; unlocked reads use acquire. Reads under
+// the node's own lock can be relaxed since lock acquire/release orders them.
 template <class Lock>
 class skiplist_index {
 public:
@@ -25,14 +28,15 @@ public:
     tail_ = new node(/*lvl*/ MAX_LEVEL - 1, /*key*/ 0, /*val*/ 0, /*is_sentinel*/ true);
     head_->is_neg_inf = true;
     tail_->is_pos_inf = true;
-    for (int i = 0; i < MAX_LEVEL; ++i) head_->next[i] = tail_;
+    for (int i = 0; i < MAX_LEVEL; ++i)
+      head_->next[i].store(tail_, std::memory_order_relaxed);
   }
 
   ~skiplist_index() {
     // Leak-friendly destruction: walk level-0 list and delete each node.
     node* n = head_;
     while (n) {
-      node* nx = n->next[0];
+      node* nx = n->next[0].load(std::memory_order_relaxed);
       delete n;
       n = nx;
     }
@@ -48,22 +52,21 @@ public:
     node* pred = head_;
     pred->lock.lock();
     for (int lvl = MAX_LEVEL - 1; lvl > 0; --lvl) {
-      // Walk right at this level using hand-over-hand.
-      while (node_lt(pred->next[lvl], key)) {
-        node* x = pred->next[lvl];
+      while (node_lt(load_next(pred, lvl), key)) {
+        node* x = load_next(pred, lvl);
         x->lock.lock();
         pred->lock.unlock();
         pred = x;
       }
     }
     // Level 0 walk
-    while (node_lt(pred->next[0], key)) {
-      node* x = pred->next[0];
+    while (node_lt(load_next(pred, 0), key)) {
+      node* x = load_next(pred, 0);
       x->lock.lock();
       pred->lock.unlock();
       pred = x;
     }
-    node* curr = pred->next[0];
+    node* curr = load_next(pred, 0);
     curr->lock.lock();
     std::optional<value_type> result;
     if (!curr->is_pos_inf && !curr->is_neg_inf && curr->key == key &&
@@ -82,20 +85,20 @@ public:
     node* pred = head_;
     pred->lock.read_lock();
     for (int lvl = MAX_LEVEL - 1; lvl > 0; --lvl) {
-      while (node_lt(pred->next[lvl], key)) {
-        node* x = pred->next[lvl];
+      while (node_lt(load_next(pred, lvl), key)) {
+        node* x = load_next(pred, lvl);
         x->lock.read_lock();
         pred->lock.read_unlock();
         pred = x;
       }
     }
-    while (node_lt(pred->next[0], key)) {
-      node* x = pred->next[0];
+    while (node_lt(load_next(pred, 0), key)) {
+      node* x = load_next(pred, 0);
       x->lock.read_lock();
       pred->lock.read_unlock();
       pred = x;
     }
-    node* curr = pred->next[0];
+    node* curr = load_next(pred, 0);
     curr->lock.read_lock();
     std::optional<value_type> result;
     if (!curr->is_pos_inf && !curr->is_neg_inf && curr->key == key &&
@@ -120,7 +123,7 @@ public:
 
       for (int lvl = MAX_LEVEL - 1; lvl >= 0 && !restart; --lvl) {
         while (true) {
-          node* next = pred->next[lvl];
+          node* next = pred->next[lvl].load(std::memory_order_acquire);
           if (!pred->lock.read_validate(v_pred)) { restart = true; break; }
           if (!node_lt(next, key)) break;
           auto v_next = next->lock.read_begin();
@@ -130,7 +133,7 @@ public:
       }
       if (restart) continue;
 
-      node* curr = pred->next[0];
+      node* curr = pred->next[0].load(std::memory_order_acquire);
       auto v_curr = curr->lock.read_begin();
       if (!pred->lock.read_validate(v_pred)) continue;
 
@@ -183,7 +186,7 @@ public:
         }
         if (pred->marked.load(std::memory_order_acquire) ||
             (succ != nullptr && succ->marked.load(std::memory_order_acquire)) ||
-            pred->next[lvl] != succ) {
+            pred->next[lvl].load(std::memory_order_relaxed) != succ) {
           valid = false;
         }
       }
@@ -193,8 +196,14 @@ public:
       }
 
       node* n = new node(new_level - 1, key, val, /*is_sentinel*/ false);
-      for (int lvl = 0; lvl < new_level; ++lvl) n->next[lvl] = succs[lvl];
-      for (int lvl = 0; lvl < new_level; ++lvl) preds[lvl]->next[lvl] = n;
+      // Fill n's next pointers before publishing. Relaxed is fine here because
+      // the release store on publication below is a fence for all prior writes.
+      for (int lvl = 0; lvl < new_level; ++lvl)
+        n->next[lvl].store(succs[lvl], std::memory_order_relaxed);
+      // Publish n into the list. Release order so unlocked readers in find() /
+      // get_optimistic() acquire-load a fully-initialized n.
+      for (int lvl = 0; lvl < new_level; ++lvl)
+        preds[lvl]->next[lvl].store(n, std::memory_order_release);
       n->fully_linked.store(true, std::memory_order_release);
       for (int j = 0; j < locked_count; ++j) locked[j]->lock.unlock();
       return true;
@@ -236,7 +245,7 @@ public:
           locked[locked_count++] = pred;
         }
         if (pred->marked.load(std::memory_order_acquire) ||
-            pred->next[lvl] != victim) {
+            pred->next[lvl].load(std::memory_order_relaxed) != victim) {
           valid = false;
         }
       }
@@ -251,8 +260,11 @@ public:
         return false;
       }
       victim->marked.store(true, std::memory_order_release);
-      for (int lvl = victim_top; lvl >= 0; --lvl)
-        preds[lvl]->next[lvl] = victim->next[lvl];
+      // Unlink top-down. Release so unlocked readers see a coherent chain.
+      for (int lvl = victim_top; lvl >= 0; --lvl) {
+        node* succ = victim->next[lvl].load(std::memory_order_relaxed);
+        preds[lvl]->next[lvl].store(succ, std::memory_order_release);
+      }
       victim->lock.unlock();
       for (int j = 0; j < locked_count; ++j) locked[j]->lock.unlock();
       return true;
@@ -261,15 +273,15 @@ public:
 
 private:
   struct node {
-    alignas(64) Lock  lock{};
-    key_type          key;
-    value_type        val;
-    int               top_level;    // highest valid index in next[]
-    std::atomic<bool> marked{false};
-    std::atomic<bool> fully_linked{false};
-    bool              is_neg_inf = false;
-    bool              is_pos_inf = false;
-    node*             next[MAX_LEVEL]{};
+    alignas(64) Lock        lock{};
+    key_type                key;
+    value_type              val;
+    int                     top_level;    // highest valid index in next[]
+    std::atomic<bool>       marked{false};
+    std::atomic<bool>       fully_linked{false};
+    bool                    is_neg_inf = false;
+    bool                    is_pos_inf = false;
+    std::atomic<node*>      next[MAX_LEVEL]{};
 
     node(int top_level_, key_type k, value_type v, bool is_sentinel)
       : key(k), val(v), top_level(top_level_) {
@@ -287,17 +299,24 @@ private:
     return n->key < key;
   }
 
+  // Helper: load next[lvl] under pred's lock. Relaxed is sufficient because
+  // the lock's acquire already synchronizes with any prior writer.
+  static node* load_next(node* pred, int lvl) noexcept {
+    return pred->next[lvl].load(std::memory_order_relaxed);
+  }
+
   // Unlocked search. Fills preds/succs for each level and returns the level at
   // which key was found (-1 otherwise). succs[lvl] is the first node with
-  // key >= requested at that level.
+  // key >= requested at that level. Uses acquire loads to see fully-initialized
+  // nodes published by concurrent writers.
   int find(key_type key, node** preds, node** succs) noexcept {
     int lfound = -1;
     node* pred = head_;
     for (int lvl = MAX_LEVEL - 1; lvl >= 0; --lvl) {
-      node* curr = pred->next[lvl];
+      node* curr = pred->next[lvl].load(std::memory_order_acquire);
       while (node_lt(curr, key)) {
         pred = curr;
-        curr = pred->next[lvl];
+        curr = pred->next[lvl].load(std::memory_order_acquire);
       }
       if (lfound == -1 && !curr->is_pos_inf && !curr->is_neg_inf &&
           curr->key == key)
