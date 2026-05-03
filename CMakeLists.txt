@@ -142,6 +142,14 @@ foreach(lk IN LISTS WH_LOCKS)
     target_compile_options(${libname} PRIVATE
         -march=native -fno-omit-frame-pointer)
   endif()
+  # Wormhole's wh.c uses NEON intrinsics with vector reinterpret patterns
+  # that GCC rejects under default strictness on aarch64 (e.g. wh.c:1610
+  # passes a uint16x8_t to vandq_u8). Apple's clang is permissive; GCC
+  # needs -flax-vector-conversions. Apply for both C and C++ TUs in this
+  # static lib regardless of compiler — flag is harmless on clang.
+  if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    target_compile_options(${libname} PRIVATE -flax-vector-conversions)
+  endif()
 
   add_executable(wh_bench_${lk} bench/wh_bench.cpp)
   target_include_directories(wh_bench_${lk} PRIVATE

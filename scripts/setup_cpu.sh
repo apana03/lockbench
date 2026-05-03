@@ -31,24 +31,42 @@ if [ "${1:-}" = "--status" ]; then
   exit 0
 fi
 
+# Some hosts (notably AWS EC2 Graviton) don't expose cpufreq at all —
+# scaling_governor either doesn't exist or is read-only. Detect that
+# and skip rather than failing under set -e.
+HAS_CPUFREQ=0
+if compgen -G '/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor' > /dev/null; then
+  HAS_CPUFREQ=1
+fi
+
 if [ "${1:-}" = "--reset" ]; then
-  for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    echo ondemand > "$f" 2>/dev/null || true
-  done
+  if [ "$HAS_CPUFREQ" = "1" ]; then
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+      echo ondemand > "$f" 2>/dev/null || true
+    done
+  else
+    echo "cpufreq not exposed on this host — nothing to reset."
+  fi
   if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
     echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo
   fi
-  echo "Reset: ondemand governor, turbo re-enabled."
+  echo "Reset complete."
   show_status
   exit 0
 fi
 
 # default: lock to performance, disable turbo
-for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-  echo performance > "$f"
-done
+if [ "$HAS_CPUFREQ" = "1" ]; then
+  for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance > "$f" 2>/dev/null || true
+  done
+  echo "Set: performance governor."
+else
+  echo "cpufreq not exposed on this host (typical on AWS EC2 Graviton);"
+  echo "  skipping governor setting. CPU frequency is hypervisor-managed."
+fi
 if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
   echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo
+  echo "Turbo disabled."
 fi
-echo "Set: performance governor, turbo disabled."
 show_status
