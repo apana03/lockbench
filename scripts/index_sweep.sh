@@ -51,23 +51,23 @@ for lock in $LOCKS; do
 done
 echo ""
 
-echo "=== Read-heavy: 95% read / 4% insert / 1% delete, Uniform ==="
+echo "=== Read-heavy: 90% read / 5% insert / 5% delete, Uniform ==="
 for lock in $LOCKS; do
   for t in $THREAD_LIST; do
     [ "$t" -gt "$MAX_THREADS" ] && continue
     for r in $(seq 1 "$REPEATS"); do
-      $BIN --lock "$lock" --dist uniform --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 3 --read_pct 95 --insert_pct 4 $PIN_FLAG --csv "$CSV"
+      $BIN --lock "$lock" --dist uniform --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 3 --read_pct 90 --insert_pct 5 $PIN_FLAG --csv "$CSV"
     done
   done
 done
 echo ""
 
-echo "=== Write-heavy: 20% read / 50% insert / 30% delete, Zipfian ==="
+echo "=== Write-heavy: 20% read / 40% insert / 40% delete, Zipfian ==="
 for lock in $LOCKS; do
   for t in $THREAD_LIST; do
     [ "$t" -gt "$MAX_THREADS" ] && continue
     for r in $(seq 1 "$REPEATS"); do
-      $BIN --lock "$lock" --dist zipfian --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 3 --read_pct 20 --insert_pct 50 $PIN_FLAG --csv "$CSV"
+      $BIN --lock "$lock" --dist zipfian --threads "$t" --seconds "$SECONDS_PER_RUN" --warmup 3 --read_pct 20 --insert_pct 40 $PIN_FLAG --csv "$CSV"
     done
   done
 done

@@ -20,4 +20,17 @@ struct ticket_lock {
     std::uint32_t cur = owner.load(std::memory_order_relaxed);
     owner.store(cur + 1, std::memory_order_release);
   }
+
+  // Non-blocking acquire that never burns a queue slot. Succeeds only if
+  // the queue is empty (next == owner). Used by wormhole's reader fast
+  // path; under sustained writer contention this will fail far more often
+  // than rw_lock's try variants. See plan/EXPERIMENT.md.
+  bool try_lock() noexcept {
+    std::uint32_t cur_owner = owner.load(std::memory_order_relaxed);
+    std::uint32_t cur_next  = next.load(std::memory_order_relaxed);
+    if (cur_next != cur_owner) return false;  // queue non-empty
+    return next.compare_exchange_strong(
+        cur_next, cur_owner + 1,
+        std::memory_order_acquire, std::memory_order_relaxed);
+  }
 };

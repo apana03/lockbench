@@ -5,16 +5,6 @@
 #include <random>
 #include <utility>
 
-// Concurrent skip list with per-node locking (pessimistic hand-over-hand).
-// Templated on lock type. Simplifications:
-//   - deleted nodes are leaked (no epoch-based reclamation); this is what
-//     keeps the OCC read path safe (readers can always dereference any node
-//     they observe, even if it is logically deleted).
-//
-// Memory ordering: next[] is std::atomic so unlocked readers (find(),
-// get_optimistic()) observe publishes without tearing. Writers publish a
-// freshly linked node with release; unlocked reads use acquire. Reads under
-// the node's own lock can be relaxed since lock acquire/release orders them.
 template <class Lock>
 class skiplist_index {
 public:

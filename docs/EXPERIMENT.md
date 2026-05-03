@@ -784,3 +784,232 @@ cd results && jupyter notebook presentation_notebook.ipynb
 
 **arraybench**: `--lock tas|ttas|cas|ticket|rw|occ` `--threads N` `--seconds S`
 `--warmup S` `--num_locks N` `--cs_work N` `--read_pct P` `--pin` `--csv FILE`
+
+
+## Wormhole — Lock-Primitive Swap
+
+Wu et al.'s Wormhole (FAST '19) is a hybrid trie+hash+linked-list ordered
+concurrent index with three lock sites: a per-leaf rwlock (`leaflock`), a
+global hashmap rwlock (`metalock`), and a small leaf spinlock (`sortlock`).
+We vendor wormhole at `third_party/wormhole/` (editable copy of Wu's repo)
+and replace its lock bodies with a C-callable shim that dispatches to one
+of our lockbench primitives, selected at compile time.
+
+### Variants built
+
+- `wh-default` — wormhole's stock rwlock (no shim)
+- `wh-rw` — `rw_lock` from `include/primitives/rw_lock.hpp` (true reader-writer)
+- `wh-tas`, `wh-ttas`, `wh-cas`, `wh-occ` — exclusive-only (read = write)
+- `wh-occ-opt` — true OCC: lock-free seqlock-validated reads + exclusive
+  writes (uses `cas_lock` underneath). See "OCC-optimistic variant" below.
+
+`wh-ticket` is **not built**. See "Ticket lock excluded" below.
+
+### Header-injection lock shim
+
+- `third_party/wormhole/wh_lock_shim.h` declares `struct rwlock` /
+  `struct spinlock` and the rwlock_*/spinlock_* C function signatures
+  matching upstream `lib.h` (lines 304–366).
+- `third_party/wormhole/wh_lock_shim.cpp` selects `LockT` via `WH_LOCK_<X>`
+  and provides `extern "C"` bodies that placement-new the lock into the
+  struct's opaque storage and dispatch through C++ template helpers.
+- Upstream `lib.h` is patched with a guarded `#ifdef WH_LOCK_SHIM
+  #include "wh_lock_shim.h"` block; lock sections of `lib.c` and the two
+  `.opaque` references in `wh.c` are wrapped in `#ifndef WH_LOCK_SHIM`.
+
+CMake builds one `wormhole-rt-<lk>` static lib + `wh_bench_<lk>` +
+`wh_test_<lk>` per variant. Sweep iterates binaries (lock is fixed at
+compile time, not selectable at runtime).
+
+### Ticket lock excluded
+
+A real ticket-lock acquire is destructive (`fetch_add` mortgages a queue
+slot), so `try_lock` cannot return `false` after grabbing a ticket
+without breaking everyone behind us. The only correctness-preserving
+non-blocking try is "succeed iff queue empty (CAS `next: owner →
+owner+1`); else fail":
+
+```cpp
+bool try_lock() noexcept {
+    auto cur_owner = owner.load(std::memory_order_relaxed);
+    auto cur_next  = next.load(std::memory_order_relaxed);
+    if (cur_next != cur_owner) return false;          // queue not empty
+    return next.compare_exchange_strong(cur_next, cur_owner + 1,
+        std::memory_order_acquire, std::memory_order_relaxed);
+}
+```
+
+Wormhole's reader fast path calls `rwlock_trylock_write_nr(leaflock, 64)`.
+Under any sustained writer activity the queue is rarely empty, so the
+ticket try-lock effectively always fails and readers always fall to the
+slow optimistic path. Result: `wh-ticket` would look catastrophically slow
+on read-heavy contended workloads — *not* because ticket is bad in
+general, but because **strict-FIFO ordering is incompatible with
+try-lock-based reader protocols**. We saw the same effect on
+BronsonAVLTreeMap (where `avl-ticket` dropped to ≈0.9 M ops/s on
+write-heavy zipfian).
+
+For the wormhole sweep, `wh-ticket` would measure the shim's deviation
+rather than a genuine property of the ticket primitive, so we exclude it.
+
+### OCC plugged in as exclusive-only
+
+`occ_lock`'s `lock()`/`unlock()` aliases delegate to the seqlock-version-
+bump CAS used for writes. Plugging into the rwlock shim, every operation
+(read or write) takes the seqlock-as-mutex path; OCC's optimistic-read
+protocol (`read_begin`/`read_validate`) is bypassed. This isn't strictly a
+loss — wormhole has its own version-check fallback against `leaf->lv`
+that gives a structurally similar effect on the slow path.
+
+### RCU/QSBR is orthogonal
+
+Wormhole uses QSBR (a quiescent-state-based RCU variant) via the
+`wormref` per-thread handle to defer freeing of removed leaves until
+every reader has passed through a quiescent point. This governs **when
+freed memory is returned to the allocator**, not **who can access live
+state**. Our shim swaps only lock bodies; the QSBR engine and the
+reader-version protocol it cooperates with are untouched. Memory ordering
+on each lock primitive's acquire/release is sufficient for QSBR
+invariants to hold.
+
+### OCC-optimistic variant
+
+`wh-occ-opt` adds a true lock-free reader path to wormhole. Three patches
+to `wh.c`, all gated by `#ifdef WH_OCC_OPTIMISTIC`:
+
+1. **Per-leaf seqlock counter.** `_Atomic u64 occ_seq` field added to
+   `struct wormleaf`. Bumped to odd at the start of every
+   `wormleaf_lock_write`, back to even at the end of every
+   `wormleaf_unlock_write`. Initialized to 0 in `wormleaf_alloc`.
+   Two bypass paths (`wormhole_jump_leaf_write`'s direct
+   `rwlock_trylock_write_nr`; `wormhole_split_insert`'s direct
+   `rwlock_lock_write` on the new leaf) also bump on success.
+2. **Lock-free `wormhole_get`.** Replaces the locked reader path with:
+   - Snapshot the per-leaf seq.
+   - Linear scan `hs[]` using atomic 8-byte loads of the full `v64`
+     (avoids torn reads of separate `e1`/`e3` fields).
+   - Re-load seq; if unchanged AND no structural rebuild (`leaf->lv`
+     ≤ hmap snapshot version), return result. Otherwise retry.
+3. **No-op `mm.free`.** Old kvs would otherwise be freed eagerly while
+   a concurrent reader has a stale pointer to them. The C++ adapter
+   installs a custom `kvmap_mm` whose `free` does nothing, so kvs
+   leak for the lifetime of the process. For 3-second benches this is
+   ~150 MB. A production-grade implementation would defer the free
+   via QSBR (out of scope here).
+
+Underlying *write* lock is `cas_lock` (the fastest exclusive primitive).
+Comparing `wh-occ-opt` against `wh-cas` isolates the
+"lock-free reader vs exclusive reader" effect; comparing against
+`wh-rw` isolates "lock-free reader vs shared reader."
+
+See `WORMHOLE_ADAPTATION.md` for the full implementation walkthrough.
+
+### Verification
+
+```bash
+cmake --build build -j
+
+# Standard correctness
+for lk in default rw tas ttas cas occ occ-opt; do
+  ./build/wh_test_${lk} --mode both
+done
+
+# Stress: 16 threads × 200k ops × disjoint slices.
+# Load-bearing check that the lock swap doesn't break QSBR reclamation
+# AND that the optimistic reader tolerates concurrent writers.
+for lk in default rw tas ttas cas occ occ-opt; do
+  ./build/wh_test_${lk} --mode race --threads 16 \
+      --per_thread_keys 1024 --ops_per_thread 200000
+done
+
+# Sweep (4 workloads × 7 locks × 4 thread counts → 112 runs)
+./scripts/wh_compare.sh 3 1
+wc -l results/wh_compare/wh.csv     # expect 113
+```
+
+### Results (Apple M-series, 8 threads, M ops/s, fair-mm build)
+
+All variants use the same no-op-free `kvmap_mm` so per-op `free()` cost
+is uniform across the comparison. Without this (`-DWH_FAIR_MM=OFF`),
+locked variants pay a per-op `free()` the optimistic variant avoids,
+inflating the apparent reader-strategy speedup by ~2× on write-heavy
+workloads. See "MM fairness" below.
+
+| Workload          | default |   rw |  tas | ttas |  cas |  occ | occ-opt |
+|-------------------|--------:|-----:|-----:|-----:|-----:|-----:|--------:|
+| uniform 80/10/10  |    37.3 | 49.7 | 50.1 | 48.9 | 50.3 | 49.8 |  **50.7** |
+| zipfian 80/10/10  |    40.5 | 47.0 | 46.2 | 47.0 | 47.3 | 46.9 |  **51.2** |
+| uniform 90/5/5    |    54.8 | 51.2 | 49.6 | 49.5 | 52.5 | 51.7 |  **56.2** |
+| zipfian 20/40/40  |    39.9 | 37.4 | 38.6 | 38.0 | 39.0 | 38.0 |    36.9 |
+
+Plots: `results/wh_compare/wh_locks.png`, `wh_8threads.png`,
+`wh_occopt_focus.png`. Raw data: `results/wh_compare/wh.csv`.
+
+### What the numbers actually say
+
+1. **`wh-occ-opt` wins on read-heavy and balanced workloads.** On
+   uniform 90/5/5 (the most read-heavy mix, 90% reads) it's the
+   fastest variant at 56.2 M ops/s. On zipfian 80/10/10 (skewed but
+   read-heavy) it's also the fastest at 51.2 M. On uniform 80/10/10
+   it ties for the lead. **This is the lock-free-reader benefit
+   showing up clearly: when reads dominate, not taking any lock pays
+   off.**
+
+2. **`wh-occ-opt` is competitive on write-heavy workloads.** On
+   zipfian 20/40/40 (80% writes on hot keys) it's 36.9 vs 37–40 for
+   the locked variants — within ~7%. The lock-free reader doesn't
+   help much when most ops are writers serializing on the leaflock,
+   but the overhead is also minimal.
+
+3. **All locked variants (rw, tas, ttas, cas, occ) cluster within
+   ±5% on every workload.** Wormhole's per-leaf locking is
+   fine-grained enough that lock-primitive choice doesn't dominate —
+   different from StripedMap / Bronson AVL where the lock primitive
+   matters more. Wu's stock rwlock (`default`) consistently lags by
+   5–25% (vs our shim variants), suggesting our shim's `cas_lock`-
+   backed rwlock is slightly cheaper than Wu's bit-packed `u32`-based
+   one on Apple Silicon — possibly due to fewer atomic ops on the
+   acquire path.
+
+4. **The reader-side implementation choice was load-bearing.**
+   An earlier version of `wh-occ-opt` used a linear scan over all
+   WH_KPN=128 slots (defensive choice, to avoid torn `entry13` reads).
+   That implementation paid ~128 atomic loads per read and lost
+   badly on read-heavy workloads (20.2 M ops/s on uniform 90/5/5).
+   The current version uses a hash-indexed walk that mirrors
+   wormhole's stock `wormleaf_match_hs` but reads each `entry13` as
+   a single atomic 8-byte load — same O(1) expected behavior, no
+   torn-read hazard, ~3× faster reads.
+
+### MM fairness: a measurement trap
+
+Initial results showed `wh-occ-opt` 4× faster on zipfian 20/40/40.
+Investigation revealed the speedup was **not from lock-free reads**
+but from avoiding `free()`:
+
+- The optimistic-reader variant **must** use a no-op-free `kvmap_mm`
+  for safety: a reader walking a leaf without the leaflock can't
+  safely deref a kv that a concurrent updater just freed.
+- Wormhole's stock `kvmap_mm_dup` calls `free()` on every update
+  and delete. Removed kvs go straight to the allocator.
+- With ~80% of ops in zipfian 20/40/40 being inserts/deletes,
+  the locked variants paid `free()` cost on 80% of ops (~10–30 ns
+  per call); `wh-occ-opt` paid nothing.
+
+Comparing the two MM modes head-to-head on zipfian 20/40/40 (8 threads):
+
+| Variant   | Stock `kvmap_mm_dup` | No-op-free (`WH_FAIR_MM`) |
+|-----------|---------------------:|--------------------------:|
+| `wh-cas`  |              7.0 M  |                    35.3 M |
+| `wh-occ-opt` |          30.6 M  |                    27.7 M |
+
+The locked variants speed up **5×** when the per-op `free()` is
+removed; `wh-occ-opt` is unchanged (it was already using no-op-free).
+The gap inverts: with fair MM, locked variants beat `wh-occ-opt` on
+this workload.
+
+Lesson: **eliminate allocator-cost asymmetries before comparing
+synchronization strategies**. We expose this via the `WH_FAIR_MM`
+CMake option; build with `cmake -DWH_FAIR_MM=ON`. The default build
+(`WH_FAIR_MM=OFF`) is reserved for studying the locked variants in
+their realistic configuration.

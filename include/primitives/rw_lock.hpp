@@ -42,4 +42,17 @@ struct rw_lock {
 
   void lock() noexcept { write_lock(); }
   void unlock() noexcept { write_unlock(); }
+
+  // Non-blocking variants used by wormhole's reader/writer fast paths.
+  bool try_write_lock() noexcept {
+    std::int32_t expected = 0;
+    return state.compare_exchange_strong(
+        expected, -1, std::memory_order_acquire, std::memory_order_relaxed);
+  }
+  bool try_read_lock() noexcept {
+    std::int32_t s = state.load(std::memory_order_relaxed);
+    if (s < 0) return false;
+    return state.compare_exchange_strong(
+        s, s + 1, std::memory_order_acquire, std::memory_order_relaxed);
+  }
 };

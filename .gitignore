@@ -22,3 +22,9 @@ __pycache__/
 results/plot*.png
 
 CLAUDE.md
+
+# Claude Code session state
+.claude/
+
+# Plotting venv created locally
+.venv-plot/

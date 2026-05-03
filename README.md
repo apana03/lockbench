@@ -293,13 +293,16 @@ results/
   x86_xeon_lockbench.csv      Intel Xeon (x86_64) lockbench sweep results
   presentation_notebook.ipynb current ARM vs x86 comparison plots
   archive/                    earlier sweeps and notebooks kept for reference
-EXPERIMENT.md                 detailed results and analysis
+docs/
+  EXPERIMENT.md               detailed results and analysis
+  INDEX_EXPERIMENT.md         per-index notes (StripedMap / BronsonAVL / Wormhole)
+  WORMHOLE_ADAPTATION.md      walkthrough of the wormhole vendoring + lock shim
 ```
 
 ## Results
 
-See [EXPERIMENT.md](EXPERIMENT.md) for detailed benchmark results, cross-architecture
-comparisons (ARM64 vs x86_64), and assembly analysis.
+See [docs/EXPERIMENT.md](docs/EXPERIMENT.md) for detailed benchmark results,
+cross-architecture comparisons (ARM64 vs x86_64), and assembly analysis.
 
 To reproduce the analysis plots:
 

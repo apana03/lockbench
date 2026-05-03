@@ -8,17 +8,36 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "../primitives/util.hpp"
 #include "zipfian.hpp"
+
+// Returns a short architecture tag: $LB_ARCH if set, else uname -m.
+inline std::string detect_arch() {
+  if (const char* e = std::getenv("LB_ARCH"); e && *e) return std::string(e);
+  struct utsname u{};
+  if (uname(&u) == 0) return std::string(u.machine);
+  return std::string("unknown");
+}
+
+// Hostname for cross-arch result tagging. Truncated to 63 chars; no domain.
+inline std::string detect_hostname() {
+  char buf[64] = {0};
+  if (gethostname(buf, sizeof(buf) - 1) != 0) return std::string("unknown");
+  if (char* dot = std::strchr(buf, '.')) *dot = '\0';
+  return std::string(buf);
+}
 
 struct params {
   std::string lock_name  = "ttas";
@@ -144,9 +163,13 @@ inline void print_bench_result(const char* label, const params& p, double secs,
   }
 
   if (!p.csv_file.empty()) {
-    std::string header = "lock;dist;zipf_theta;threads;buckets;key_range;read_pct;insert_pct;delete_pct;total_ops;gets;puts;removes;ops_s;ns_op;fairness_min;fairness_max;fairness_ratio";
+    // Cache arch+hostname (cheap, but no need to re-query per row).
+    static const std::string arch = detect_arch();
+    static const std::string host = detect_hostname();
+    std::string header = "arch;hostname;lock;dist;zipf_theta;threads;buckets;key_range;read_pct;insert_pct;delete_pct;total_ops;gets;puts;removes;ops_s;ns_op;fairness_min;fairness_max;fairness_ratio";
     std::ostringstream row;
-    row << label << ";" << p.dist << ";" << fmt_double(p.zipf_theta) << ";"
+    row << arch << ";" << host << ";"
+        << label << ";" << p.dist << ";" << fmt_double(p.zipf_theta) << ";"
         << p.threads << ";"
         << p.num_buckets << ";" << p.key_range << ";" << p.read_pct << ";"
         << p.insert_pct << ";" << delete_pct << ";"
