@@ -17,13 +17,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// stdalign.h defines `alignas` as a macro in C (mapping to _Alignas);
+// in C++ it's already a keyword. Using `alignas` keeps this header
+// compilable as both C (lib.h includes it) and C++ (wh_lock_shim.cpp).
+// The bare `_Alignas` works on Apple Clang in C++ but GCC rejects it.
+#ifndef __cplusplus
+#include <stdalign.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // 128 bytes covers ticket_lock (two alignas(64) atomics).
-typedef struct { _Alignas(64) unsigned char storage[128]; } rwlock;
-typedef struct { _Alignas(64) unsigned char storage[128]; } spinlock;
+typedef struct { alignas(64) unsigned char storage[128]; } rwlock;
+typedef struct { alignas(64) unsigned char storage[128]; } spinlock;
 
 // spinlock — sortlock site
 extern void  spinlock_init(spinlock *l);
