@@ -29,7 +29,16 @@
 extern "C" {
 #endif
 
-// 128 bytes covers ticket_lock (two alignas(64) atomics).
+// 128 bytes covers ticket_lock (two cache-line-aligned atomics).
+// alignas(64) keeps placement-new of LockT well-defined for primitives
+// whose internal atomics declare alignas(64) (occ_lock, ticket_lock).
+// For sizeof(struct wormleaf) to be a multiple of 64 — which the slab
+// allocator needs so every leaf in a block is 64-byte aligned — the
+// auto-tail-padding from alignof(wormleaf)=64 is enough on its own.
+// Separately, wh.c bumps the alignment of leaf->hs[] to 32 when
+// WH_LOCK_SHIM is set so wormleaf_shift_inc/dec's _mm256_load_si256
+// /_mm_load_si128 on leaf->ss don't fault on x86; that fix is
+// orthogonal to the choice of alignment here.
 typedef struct { alignas(64) unsigned char storage[128]; } rwlock;
 typedef struct { alignas(64) unsigned char storage[128]; } spinlock;
 

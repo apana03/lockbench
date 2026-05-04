@@ -33,9 +33,9 @@
 #endif
 
 static_assert(sizeof(LockT)  <= sizeof(rwlock::storage),  "grow rwlock storage");
-static_assert(alignof(LockT) <= alignof(rwlock),          "grow rwlock alignment");
+static_assert(alignof(LockT) <= alignof(rwlock),          "raise rwlock alignment");
 static_assert(sizeof(LockT)  <= sizeof(spinlock::storage),"grow spinlock storage");
-static_assert(alignof(LockT) <= alignof(spinlock),        "grow spinlock alignment");
+static_assert(alignof(LockT) <= alignof(spinlock),        "raise spinlock alignment");
 
 static inline LockT* as_rw(rwlock* l)   { return std::launder(reinterpret_cast<LockT*>(l->storage)); }
 static inline LockT* as_sp(spinlock* l) { return std::launder(reinterpret_cast<LockT*>(l->storage)); }

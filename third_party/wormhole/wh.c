@@ -73,7 +73,17 @@ struct wormleaf {
   u64 reserved[2];
 #endif
 
-  struct entry13 hs[WH_KPN]; // sorted by hashes
+  // _Alignas(32) on hs[] keeps the AVX2 / SSE2 aligned loads on ss[]
+  // (in wormleaf_shift_inc / wormleaf_shift_dec) safe on x86 when the
+  // shim is in use. The shim's leaflock+sortlock occupy 256 B each
+  // (vs upstream's 4 B), pushing hs[] to a 16-misaligned offset; the
+  // pad before hs[] forces hs[] to a 32-byte boundary, and since
+  // sizeof(hs) = 128*8 = 1024 is a multiple of 32, ss[] (which begins
+  // immediately after hs[]) inherits 32-byte alignment too. Without
+  // this, _mm256_load_si256((m256*)leaf->ss) faults on Xeon. Harmless
+  // when WH_LOCK_SHIM is unset (hs[] is already 64-aligned at offset
+  // 64) — the _Alignas just confirms what's already true.
+  _Alignas(32) struct entry13 hs[WH_KPN]; // sorted by hashes
   u8 ss[WH_KPN]; // sorted by keys
 };
 

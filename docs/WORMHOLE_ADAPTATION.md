@@ -483,6 +483,57 @@ For the OCC-optimistic variant we explicitly initialize `occ_seq` to 0
 in `wormleaf_alloc`; without this, fresh leaves can start with an odd
 seq and the optimistic reader spins forever.
 
+### Shim layout must keep `leaf->ss[]` 32-byte aligned for x86 SIMD
+
+**Symptom (Xeon-only).** Every shim variant — `wh-rw`, `wh-tas`,
+`wh-cas`, `wh-ttas`, `wh-occ`, `wh-occ-opt` — crashed with SIGSEGV
+inside `wormleaf_insert_hs` (and its callees `wormleaf_shift_inc` /
+`wormleaf_shift_dec`) on the very first prefill insert. `wh-default`
+ran clean. The crash hit on Xeon (GCC 11, x86_64, `-O3 -march=native`)
+and was invisible on Apple Silicon (Apple Clang, ARM NEON).
+
+**Root cause.** `wormleaf_shift_inc` / `wormleaf_shift_dec` use
+`_mm256_load_si256((m256*)(leaf->ss+i))` (AVX2) or
+`_mm_load_si128((m128*)(leaf->ss+i))` (SSE2) — *aligned* loads that
+require `leaf->ss` to be 32-byte / 16-byte aligned. With upstream's
+4-byte `rwlock` and `spinlock`, `ss[]` lands at offset 1088 inside
+`wormleaf` (32-aligned). With the shim's 128-byte `rwlock` / `spinlock`
+(needed to fit any of our primitives), the layout shifts and `ss[]`
+ends up at offset 1336, where `1336 % 16 == 8`. The aligned SIMD load
+faults. NEON's `vld1q_u8` doesn't require alignment, so Apple Silicon
+silently tolerated the misaligned address.
+
+**Fix.** Add `_Alignas(32)` to the `hs[]` field of `struct wormleaf`
+in `wh.c`. With the shim, this inserts 8 bytes of padding before
+`hs[]`, pushing `hs[]` from offset 312 → 320 (32-aligned). Since
+`sizeof(hs) = 128 * 8 = 1024` is itself a multiple of 32, `ss[]`
+(immediately after `hs[]`) inherits 32-byte alignment too. Without
+the shim, `hs[]` is already 64-aligned (offset 64), so the
+`_Alignas(32)` is a no-op — confirming what's already true.
+
+The shim's `rwlock` / `spinlock` keep their original `alignas(64)`,
+which gives `LockT` (e.g. `occ_lock`'s `alignas(64)` version atomic)
+proper cache-line isolation. `alignof(wormleaf) = 64` from the shim
+also forces the C-standard tail padding to make
+`sizeof(wormleaf) = 1472 = 23 × 64`, so the slab carves leaves at a
+multiple of 64 bytes and every leaf in a slab page is 64-byte aligned.
+That part was already correct; the shift-loop crash was a *separate*
+alignment requirement on `ss[]`, not on the leaf itself.
+
+Earlier mis-diagnosis worth recording: an attempted "fix" lowered the
+shim alignment to `alignas(8)`, on the theory that the leaves were
+under-aligned at the slab level. That left `ss[]` still misaligned
+(the actual bug) *and* introduced UB whenever `LockT` had `alignas(64)`
+internal atomics — placement-new of an over-aligned type into
+under-aligned storage. Empirically, this caused every shim variant
+(`wh-rw`, `wh-cas`, etc.) to hang at 99% CPU on Mac inside
+`rwlock_trylock_write`, even single-threaded with 5000 ops. The exact
+mechanism wasn't pinned down, but Apple Clang's `-O3` is permissive
+about implied alignment; the working hypothesis is that some access
+along the lock-acquire path was miscompiled when the type's stated
+alignment didn't match the actual placement. Reverted in the same
+change as the proper `_Alignas(32)` patch on `hs[]`.
+
 ## 8. Verification
 
 ```bash
