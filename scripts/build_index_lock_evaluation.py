@@ -278,6 +278,40 @@ add_textbox(sl,
     Inches(0.6), Inches(5.2), Inches(12.1), Inches(2.0), size=13, color=BLACK)
 
 
+# ----- Slide: thread pinning details (Graviton specific) -----
+sl = prs.slides.add_slide(BLANK)
+add_title(sl, 'Thread pinning details, Graviton specifics',
+          'How --pin works in the harness, and what it actually does on a c6g instance')
+body = [
+    'How --pin is implemented (Linux only, in include/primitives/util.hpp):',
+    '   set_thread_affinity(thread_id) calls sched_setaffinity with a cpu_set_t containing only that one CPU.',
+    '   Threads are numbered 0, 1, 2, ..., so thread N gets pinned to logical CPU N.',
+    '   Pinning is dense and sequential: a 4 thread run uses CPUs 0..3, an 8 thread run uses CPUs 0..7.',
+    '',
+    'What that means on AWS Graviton specifically:',
+    '   c6g instances run Neoverse N1 cores. Neoverse N1 does NOT support SMT, so one vCPU is one physical core.',
+    '   The kernel sees CPUs 0..7 on a c6g.2xlarge, and those map 1 to 1 to physical Graviton cores.',
+    '   AWS Nitro / Graviton does not migrate vCPUs across physical cores at runtime under steady load.',
+    '   So sched_setaffinity to CPU N effectively pins to physical core N for the duration of the run.',
+    '   Each pinned thread also gets a hypervisor managed clock that does not vary at runtime, which is one',
+    '   reason fairness numbers on Graviton are very tight (around 0.98 across all benches).',
+    '',
+    'Honest disclaimer about the data in this deck:',
+    '   The harness has a --pin flag, but only the standalone cds_sweep.sh passes it. The two sweep scripts',
+    '   used to produce these slides (wh_compare.sh and run_avl_compare.sh) do NOT pass --pin.',
+    '   So the Wormhole, BronsonAVL, and StripedMap numbers in this deck are from UNPINNED runs.',
+    '',
+    'Why this is fine for the comparison we are presenting:',
+    '   We checked directly (StripedMap pinned vs unpinned on Graviton at 8T): avg fairness 0.984 vs 0.982.',
+    '   Same on Xeon: 0.909 vs 0.908. Pinning has effectively no impact at the scale of this study.',
+    '   On Graviton this is because the hypervisor placement is already stable. On Xeon it is because the',
+    '   variance comes from DVFS, not from thread migration.',
+    '   We will normalize this in the next iteration so all three sweeps pass --pin on Linux.',
+]
+add_textbox(sl, body, Inches(0.5), Inches(1.4), Inches(12.3), Inches(5.8),
+            size=11, color=BLACK)
+
+
 # ----- Slide 4: How we built StripedMap -----
 sl = prs.slides.add_slide(BLANK)
 add_title(sl, 'How we built StripedMap',
@@ -521,29 +555,68 @@ add_textbox(sl,
     Inches(0.5), Inches(6.85), Inches(12.3), Inches(0.6), size=11, color=BLACK)
 
 
-# ----- Final slide: next steps -----
+# ----- Slide N: open question and scope expansion (from supervisor feedback) -----
 sl = prs.slides.add_slide(BLANK)
-add_title(sl, 'Next steps')
+add_title(sl, 'Next steps, part 1: an open question to address',
+          'From supervisor feedback')
 body = [
-    '   Add Apple Silicon back to the cross arch comparison, just for Wormhole.',
-    '   The M3 P core and E core split makes scaling numbers harder to interpret,',
-    '   so the plan is to limit the comparison to the first 8 P cores only.',
+    'The question:',
+    '   "Have you examined all synchronization related instructions in armv8 and x86 to make sure that the locks',
+    '   we have been evaluating cover them all? One of the original questions we want to answer is what is the',
+    '   perf difference between directly writing assemblies and using C++ atomics. And it seems that we have',
+    '   been evaluating only the latter."',
     '',
-    '   Get sudo access on the Xeon for one short controlled run.',
-    '   With setup_cpu.sh (performance governor and turbo off) we can rerun a small slice and',
-    '   confirm whether the Xeon variance we currently see is mostly DVFS noise or something deeper.',
+    'Honest answer:',
+    '   Right. Every lock primitive we have evaluated so far (tas, ttas, cas, ticket, rw, occ) is built on',
+    '   std::atomic. The compiler picks the underlying instruction. On Graviton with -march=native we should be',
+    '   getting the ARMv8.1 LSE atomics (cas, casal, swp, ldadd) but we have not actually verified this with',
+    '   objdump. On Xeon we get the lock prefixed instructions (lock cmpxchg, lock xchg, lock xadd).',
     '',
-    '   Add a per arch lock latency micro benchmark.',
-    '   The current numbers are throughput inside an index. A pure latency view of acquire',
-    '   and release on each architecture would close the loop, by separating raw atomic cost',
-    '   from contention behaviour.',
-    '',
-    '   Write up a short paper section on the cross architecture lock ranking story.',
-    '   The fact that ttas wins more often on Graviton while cas and ticket show up more on Xeon',
-    '   is a concrete result worth landing in writing.',
+    'Things our current set does NOT cover:',
+    '   On ARM, WFE (Wait For Event) and SEV (Send Event). These let a spinning core enter a low power wait',
+    '   that wakes when the cache line changes. The Linux kernel arm64 spinlock uses them. Our cpu_relax just',
+    '   does YIELD which is a hint that is largely a NOP on Neoverse cores.',
+    '   On ARM, hand picking barrier strength (DMB ISHLD vs DMB ISHST vs DMB ISH SY) instead of letting the',
+    '   compiler map memory_order_release to whichever DMB it picks.',
+    '   On x86, there is much less missing. PAUSE we already use. UMONITOR / UMWAIT exists on Tremont and',
+    '   Tigerlake plus, but diascld45 (Haswell era) does not have it. TSX HLE and RTM are disabled in microcode',
+    '   on most modern Xeons due to MDS / Spectre mitigations.',
 ]
 add_textbox(sl, body, Inches(0.5), Inches(1.4), Inches(12.3), Inches(5.8),
-            size=14, color=BLACK)
+            size=11, color=BLACK)
+
+
+# ----- Slide N+1: concrete experiments and remaining work -----
+sl = prs.slides.add_slide(BLANK)
+add_title(sl, 'Next steps, part 2: concrete experiments to run')
+body = [
+    'A. Verify what GCC actually emits for our locks (low effort, high information).',
+    '   Run objdump -d on each wormhole-rt-<lock>.a on Graviton and Xeon. Check that:',
+    '      tas_lock and ttas_lock use casal (LSE) on Graviton, lock cmpxchg / lock xchg on Xeon.',
+    '      cas_lock uses cas (LSE) on Graviton.',
+    '   If we are still seeing ldaxr / stlxr loops on Graviton, our -march flag is wrong and we are paying',
+    '   the LL/SC penalty unnecessarily.',
+    '',
+    'B. Add a WFE based spinlock primitive (most promising new direction for ARM).',
+    '   New file: include/primitives/tas_lock_wfe.hpp and a matching cas_lock_wfe.hpp.',
+    '   The acquire path: try the atomic, on failure use WFE to wait for any change to the cache line, then retry.',
+    '   The release path: store, then SEV to wake any waiting cores. Reference: Linux arch/arm64 spinlock.h.',
+    '   Plug into the Wormhole shim and compare against the YIELD based versions on Graviton.',
+    '   Hypothesis: at high contention, WFE saves real power and may reduce coherence traffic;',
+    '   at low contention it is a wash or slightly slower because of the extra SEV.',
+    '',
+    'C. Hand assembly TAS and CAS to compare against std::atomic versions.',
+    '   Write a tas_lock_asm and cas_lock_asm that use inline asm directly (LSE on ARM, lock prefix on x86).',
+    '   Compare the throughput at every thread point. The expected delta is small if -march=native is doing',
+    '   its job, but if there is a measurable gap that is itself an interesting finding for the writeup.',
+    '',
+    'D. Smaller items still on the list.',
+    '   Get sudo on Xeon for one controlled run with setup_cpu.sh, to separate DVFS noise from real lock behaviour.',
+    '   Add Apple M3 back for the Wormhole comparison (P cores only, capped at 6T to stay homogeneous).',
+    '   Write up the cross arch lock ranking finding (ttas wins more on Graviton, cas / ticket more on Xeon).',
+]
+add_textbox(sl, body, Inches(0.5), Inches(1.4), Inches(12.3), Inches(5.8),
+            size=11, color=BLACK)
 
 
 out_path = DECK_DIR / 'index_lock_evaluation.pptx'
