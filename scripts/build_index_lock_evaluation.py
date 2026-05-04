@@ -67,8 +67,9 @@ print(f'  wh: {len(wh)} rows, cds: {len(cds)} rows, avl: {len(avl)} rows')
 
 def plot_lines_and_bars(df, locks, palette, title, workload, fname):
     """2x2: top row is line plots vs threads; bottom row is bar chart at maxT.
-    Left column is Graviton, right column is Xeon."""
-    fig, axes = plt.subplots(2, 2, figsize=(13, 7.5),
+    Left column is Graviton, right column is Xeon. Aspect ratio chosen so
+    the image fits cleanly under the slide title without overflow."""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 6.4),
                              gridspec_kw={'height_ratios': [3, 2]})
     for col, arch in enumerate(['graviton', 'xeon']):
         sub = df[(df.arch == arch) & (df.workload == workload)]
@@ -182,15 +183,16 @@ def add_title(slide, title, subtitle=None):
                     size=13, color=GREY)
 
 
-def add_image_slide(title, subtitle, image_path, bullets):
+def add_image_slide(title, subtitle, image_path):
+    """Throughput slide: title row plus a single combined figure.
+    Image is sized to fit the available slide height with no overlap."""
     sl = prs.slides.add_slide(BLANK)
     add_title(sl, title, subtitle)
+    # figure aspect is 14x6.4 = 2.1875. With image height 5.6", width 12.25".
+    # Slide is 13.333" wide; centred horizontally: left = (13.333 - 12.25)/2 = 0.54".
     sl.shapes.add_picture(str(image_path),
-                          Inches(0.6), Inches(1.4),
-                          width=Inches(11.0))
-    if bullets:
-        add_textbox(sl, bullets, Inches(0.6), Inches(6.3), Inches(12.1), Inches(1.1),
-                    size=12, color=BLACK)
+                          Inches(0.55), Inches(1.5),
+                          width=Inches(12.25))
     return sl
 
 
@@ -454,77 +456,42 @@ add_image_slide(
     title='Wormhole, balanced workload (uniform 80 percent reads)',
     subtitle='Top: throughput vs threads. Bottom: ranking at the architecture\'s maximum threads.',
     image_path=plots['wh_balanced'],
-    bullets=[
-        '   On Graviton at 8T, occ-opt finishes on top (32.3 M ops/s). tas and occ are right behind.',
-        '   On Xeon at 16T, ttas wins narrowly (39.0 M) with occ-opt almost tied at 38.7 M.',
-        '   wh-default (upstream wormhole rwlock) is in the middle of the pack on both machines.',
-    ],
 )
 
 add_image_slide(
     title='Wormhole, read heavy workload (uniform 90 percent reads)',
     subtitle='Where an optimistic reader is expected to win',
     image_path=plots['wh_readheavy'],
-    bullets=[
-        '   On Xeon, occ-opt opens a clear gap (43.9 M, vs 40.6 M for ttas at 16T).',
-        '   On Graviton, tas, occ-opt and ttas finish within a couple of percent at 8T.',
-        '   The optimistic reader is the design that benefits most from a high read percentage, especially on x86.',
-    ],
 )
 
 add_image_slide(
     title='Wormhole, write heavy workload (zipfian 20 percent reads, 40 inserts, 40 deletes)',
     subtitle='Hot key contention, where readers cannot escape conflict',
     image_path=plots['wh_writeheavy'],
-    bullets=[
-        '   On Graviton at 8T, tas, ttas and cas pull ahead (around 30 M).',
-        '   On Xeon at 16T, occ-opt is still on top (22.5 M) with rw and tas right next to it.',
-        '   Even on the workload least favourable to the optimistic path, it does not collapse.',
-    ],
 )
 
 add_image_slide(
     title='libcds StripedMap, balanced workload (uniform 80 percent reads)',
     subtitle='Per stripe lock contention, no traversal',
     image_path=plots['cds_balanced'],
-    bullets=[
-        '   On Graviton at 8T, ttas wins (32.8 M) with cas right behind (32.4 M).',
-        '   On Xeon at 16T, tas takes the lead (18.4 M) with ttas second (16.1 M).',
-        '   Different best lock per architecture even on the simplest workload.',
-    ],
 )
 
 add_image_slide(
     title='libcds StripedMap, hot key workload (zipfian 80 percent reads)',
     subtitle='A few stripes carry most of the traffic',
     image_path=plots['cds_zipfian'],
-    bullets=[
-        '   On Graviton at 8T, tas leads (32.0 M), with std::mutex and cas tied just behind.',
-        '   On Xeon at 16T, cas wins (13.6 M) with ticket and tas close together.',
-        '   The drop from balanced to hot key on Xeon is large, which matches expectations.',
-    ],
 )
 
 add_image_slide(
     title='libcds BronsonAVL, balanced workload (uniform 80 percent reads)',
     subtitle='Per node monitor lock, much smaller contention surface than StripedMap',
     image_path=plots['avl_balanced'],
-    bullets=[
-        '   On Graviton at 8T, cas and ttas finish in a dead heat at 9.8 M.',
-        '   On Xeon at 16T, tas leads (13.3 M), with ttas and cas within a few percent.',
-        '   BronsonAVL absolute throughput is lower than StripedMap because traversal cost is real.',
-    ],
 )
 
 add_image_slide(
     title='libcds BronsonAVL, write heavy workload',
     subtitle='Tree mutations create more lock acquisition per operation',
     image_path=plots['avl_writeheavy'],
-    bullets=[
-        '   On Graviton at 8T, cas takes the lead (8.6 M) with ttas and tas close behind.',
-        '   On Xeon at 16T, ticket wins (3.4 M), with std::mutex unusually close.',
-        '   Different best lock per architecture is exactly the cross arch story we wanted to surface.',
-    ],
 )
 
 
