@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "../primitives/util.hpp"
+#include "op_stream.hpp"
 #include "zipfian.hpp"
 
 // Returns a short architecture tag: $LB_ARCH if set, else uname -m.
@@ -52,7 +53,8 @@ struct params {
   std::uint64_t key_range = 1'000'000;
   std::size_t prefill     = 500'000;
   std::string csv_file;
-  bool pin              = false;
+  pin_policy pin = pin_policy::off;       // thread pinning policy (Linux only)
+  std::size_t stream_len = 4096;          // per-thread pre-rolled (key,op) stream length (pow2)
 };
 
 inline void bench_usage(const char* prog) {
@@ -71,7 +73,9 @@ inline void bench_usage(const char* prog) {
     "  --buckets <N>       Hash table buckets (hash only) [default: 65536]\n"
     "  --key_range <N>     Key space size [default: 1000000]\n"
     "  --prefill <N>       Keys to pre-insert [default: 500000]\n"
-    "  --pin               Pin threads to cores (Linux only)\n"
+    "  --pin               Shorthand for --pin_policy compact_phys (Linux only)\n"
+    "  --pin_policy <p>    Pinning policy: off|linear|compact_phys|compact_socket\n"
+    "  --stream_len <N>    Per-thread pre-rolled (key,op) stream length [default: 4096, rounded up to pow2]\n"
     "  --csv <file>        Append results as CSV to file\n";
 }
 
@@ -95,7 +99,9 @@ inline params parse_bench_args(int argc, char** argv) {
     else if (a == "--key_range")  p.key_range     = std::stoull(need("--key_range"));
     else if (a == "--prefill")    p.prefill       = std::stoull(need("--prefill"));
     else if (a == "--csv")        p.csv_file      = need("--csv");
-    else if (a == "--pin")        p.pin           = true;
+    else if (a == "--pin")        p.pin           = pin_policy::compact_phys;
+    else if (a == "--pin_policy") p.pin           = parse_pin_policy(need("--pin_policy"));
+    else if (a == "--stream_len") p.stream_len    = std::stoull(need("--stream_len"));
     else if (a == "--help" || a == "-h") { bench_usage(argv[0]); std::exit(0); }
     else { std::cerr << "Unknown arg: " << a << "\n"; std::exit(2); }
   }
@@ -104,6 +110,7 @@ inline params parse_bench_args(int argc, char** argv) {
   p.warmup_seconds = std::max(p.warmup_seconds, 0);
   p.read_pct = std::clamp(p.read_pct, 0, 100);
   p.insert_pct = std::clamp(p.insert_pct, 0, 100 - p.read_pct);
+  p.stream_len = round_up_pow2(p.stream_len);
   return p;
 }
 
@@ -182,12 +189,19 @@ inline void print_bench_result(const char* label, const params& p, double secs,
 
 // Generic driver: spawns workers, prefill must already be done, each thread runs
 // get_fn / put_fn / remove_fn mixed according to read_pct / insert_pct.
+//
+// Two-phase pattern (see bench/main.cpp bench_mutex for design notes):
+//   Phase 1 (warmup): untimed, no counting; runs same op mix to warm caches/branch
+//                     predictors and let the index settle into steady state.
+//   Phase 2 (measurement): every iter counts; stop is checked every 64 iters so the
+//                          atomic load stays out of the per-op hot path.
 template <class Index, class GetFn, class PutFn, class RemFn>
 inline void run_bench_common(const params& p, const char* label, Index& index,
                              GetFn get_fn, PutFn put_fn, RemFn remove_fn) {
   std::atomic<bool> stop{false};
-  std::atomic<bool> measuring{false};
-  start_barrier barrier(p.threads);
+  std::atomic<bool> warmup_done{false};
+  start_barrier start_b(p.threads);
+  start_barrier phase_b(p.threads);
 
   std::vector<thread_stats> stats(p.threads);
   std::vector<std::thread> workers;
@@ -196,49 +210,57 @@ inline void run_bench_common(const params& p, const char* label, Index& index,
   for (int t = 0; t < p.threads; ++t) {
     workers.emplace_back([&, t] {
       setup_worker_thread(t, p.pin);
-      barrier.arrive_and_wait();
+
+      // Pre-roll the per-thread (key, op) stream after pinning so the
+      // allocation first-touches on the worker's NUMA-local core.
+      std::vector<op_entry> stream = (p.dist == "zipfian")
+          ? make_stream_zipfian(p.key_range, p.zipf_theta,
+                                p.read_pct, p.insert_pct,
+                                p.stream_len,
+                                static_cast<std::uint64_t>(t) + 100,
+                                static_cast<std::uint64_t>(t) + 200)
+          : make_stream_uniform(p.key_range,
+                                p.read_pct, p.insert_pct,
+                                p.stream_len,
+                                static_cast<std::uint64_t>(t) + 100,
+                                static_cast<std::uint64_t>(t) + 200);
+      const op_entry* __restrict__ s = stream.data();
+      const std::size_t mask = p.stream_len - 1;
+      // Decorrelate thread start positions so phase 2 doesn't see all
+      // threads at idx=0; warmup duration jitter further breaks any sync
+      // the offset didn't cover. idx survives phase 1 → phase 2.
+      std::size_t idx = (p.threads > 0)
+          ? (static_cast<std::size_t>(t) * (p.stream_len / static_cast<std::size_t>(p.threads))) & mask
+          : 0;
+
+      start_b.arrive_and_wait();
 
       std::uint64_t local_gets = 0, local_puts = 0, local_rems = 0;
 
-      if (p.dist == "zipfian") {
-        zipfian_generator gen(p.key_range, p.zipf_theta, t + 100);
-        std::mt19937 op_rng(t + 200);
-        std::uniform_int_distribution<int> op_dist(0, 99);
-
-        while (!stop.load(std::memory_order_relaxed)) {
-          std::uint64_t key = gen.next_scrambled();
-          int op = op_dist(op_rng);
-          if (op < p.read_pct) {
-            get_fn(index, key);
-            if (measuring.load(std::memory_order_relaxed)) ++local_gets;
-          } else if (op < p.read_pct + p.insert_pct) {
-            put_fn(index, key);
-            if (measuring.load(std::memory_order_relaxed)) ++local_puts;
-          } else {
-            remove_fn(index, key);
-            if (measuring.load(std::memory_order_relaxed)) ++local_rems;
-          }
+      auto do_op = [&]() -> int {
+        const op_entry e = s[idx];
+        idx = (idx + 1) & mask;
+        switch (e.op) {
+          case 0:  get_fn(index, e.key);    return 0;
+          case 1:  put_fn(index, e.key);    return 1;
+          default: remove_fn(index, e.key); return 2;
         }
-      } else {
-        std::mt19937_64 key_rng(t + 100);
-        std::uniform_int_distribution<std::uint64_t> key_dist(0, p.key_range - 1);
-        std::mt19937 op_rng(t + 200);
-        std::uniform_int_distribution<int> op_dist(0, 99);
+      };
 
-        while (!stop.load(std::memory_order_relaxed)) {
-          std::uint64_t key = key_dist(key_rng);
-          int op = op_dist(op_rng);
-          if (op < p.read_pct) {
-            get_fn(index, key);
-            if (measuring.load(std::memory_order_relaxed)) ++local_gets;
-          } else if (op < p.read_pct + p.insert_pct) {
-            put_fn(index, key);
-            if (measuring.load(std::memory_order_relaxed)) ++local_puts;
-          } else {
-            remove_fn(index, key);
-            if (measuring.load(std::memory_order_relaxed)) ++local_rems;
-          }
+      // Phase 1: warmup, untimed. Same stream/do_op as phase 2; idx
+      // carries over so phase 2 doesn't restart at the head of the stream.
+      while (!warmup_done.load(std::memory_order_relaxed)) (void)do_op();
+      phase_b.arrive_and_wait();
+
+      // Phase 2: measurement; every iter counts, stop checked every 64 iters.
+      for (;;) {
+        for (int k = 0; k < 64; ++k) {
+          int r = do_op();
+          if (r == 0) ++local_gets;
+          else if (r == 1) ++local_puts;
+          else ++local_rems;
         }
+        if (stop.load(std::memory_order_relaxed)) break;
       }
 
       stats[t].gets    = local_gets;
@@ -247,16 +269,19 @@ inline void run_bench_common(const params& p, const char* label, Index& index,
     });
   }
 
-  barrier.wait_all_arrived();
-  barrier.release();
+  start_b.wait_all_arrived();
+  start_b.release();
 
   if (p.warmup_seconds > 0)
     std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
+  warmup_done.store(true, std::memory_order_release);
 
-  measuring.store(true, std::memory_order_relaxed);
+  phase_b.wait_all_arrived();
   auto t0 = std::chrono::steady_clock::now();
+  phase_b.release();
+
   std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
-  stop.store(true, std::memory_order_relaxed);
+  stop.store(true, std::memory_order_release);
   for (auto& th : workers) th.join();
   auto t1 = std::chrono::steady_clock::now();
 
@@ -275,12 +300,27 @@ inline void run_bench_common(const params& p, const char* label, Index& index,
 }
 
 // Uniformly prefill keys into an index with put(key, key+1).
+//
+// When pinning is enabled, the calling (main) thread is temporarily pinned to
+// the first slot in the policy's order — typically a socket-0 P-core. On NUMA
+// machines this first-touches the index allocations onto that socket, matching
+// where low-thread-count worker runs land. After prefill, affinity is reset so
+// the kernel can place subsequently-spawned worker threads under their own
+// per-thread pin policy. No-op on macOS / when pinning is off.
 template <class Index>
 inline void prefill_index(Index& index, const params& p) {
+  bool repinned = false;
+  if (p.pin != pin_policy::off) {
+    int target = resolve_pin_target(0, p.pin);
+    if (target >= 0) repinned = set_thread_affinity(target);
+  }
+
   std::mt19937_64 rng(12345);
   std::uniform_int_distribution<std::uint64_t> key_dist(0, p.key_range - 1);
   for (std::size_t i = 0; i < p.prefill; ++i) {
     std::uint64_t k = key_dist(rng);
     index.put(k, k + 1);
   }
+
+  if (repinned) clear_thread_affinity();
 }

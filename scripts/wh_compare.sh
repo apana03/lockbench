@@ -1,57 +1,43 @@
 #!/usr/bin/env bash
-# wh_compare.sh — Sweep wormhole across lock variants, workloads, and threads.
-# 6 binaries × 4 workloads × 4 thread points × 1 repeat. Ticket lock is
-# excluded by design (see CMakeLists.txt + EXPERIMENT.md).
+# wh_compare.sh — Sweep wormhole across lock variants on the shared
+# cache-regime workload matrix.
 #
-# Args: ./wh_compare.sh [seconds] [warmup]
+# Lock list (wormhole-specific; selected at compile time per binary):
+#   default      — wormhole's stock rwlock (counter-based)
+#   tas/ttas/cas — exclusive spinlocks (used as both rwlock paths in the shim)
+#   occ          — optimistic-read seqlock (write-side only via shim)
+#   occ-opt      — optimistic readers walk leaves without leaflock (lock-free reads)
+#   pcpu-rw      — per-CPU rwlock (reader-scalable; new — see D9 in INDEX_LOCK_DECISIONS.md)
+#
+# All other knobs (workloads, threads, pinning, repeats) come from
+# scripts/sweep_common.sh so this matches cds_sweep.sh and run_avl_compare.sh.
+#
+# Args: ./wh_compare.sh [seconds] [warmup] [repeats]
+#       ./wh_compare.sh --quick      (5s × 1 repeat for iteration)
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/sweep_common.sh"
 
-SECONDS_PER_RUN=${1:-3}
-WARMUP=${2:-1}
+if [ "${1:-}" = "--quick" ]; then
+  SECONDS_PER_RUN=5; WARMUP=1; REPEATS=1
+  shift
+else
+  SECONDS_PER_RUN=${1:-$DEFAULT_SECONDS}
+  WARMUP=${2:-$DEFAULT_WARMUP}
+  REPEATS=${3:-$DEFAULT_REPEATS}
+fi
 
-ARCH="${LB_ARCH:-$(uname -m)}"
-OUT_DIR="${LB_RESULTS:-results/$ARCH}/wh_compare"
+OUT_DIR="${LB_RESULTS:-results/$LB_ARCH}/wh_compare"
 WH_CSV="$OUT_DIR/wh.csv"
-
 mkdir -p "$OUT_DIR"
 rm -f "$WH_CSV"
 
-# macOS: caffeinate keeps the system from idle-sleeping mid-sweep.
-WRAP=""
-if [ "$(uname)" = "Darwin" ] && command -v caffeinate >/dev/null 2>&1; then
-  WRAP="caffeinate -dim"
-fi
+LOCKS="default tas ttas cas occ occ-opt pcpu-rw"
 
-# Power-of-2 thread ladder up to logical CPU count, plus the cap if
-# it isn't already a power of 2.
-NCPU=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 8)
-THREADS=$(awk -v n="$NCPU" 'BEGIN { t=1; while (t<=n) { printf "%d ", t; t*=2 } if ((t/2) != n) printf "%d", n }')
-
-LOCKS="default rw tas ttas cas occ occ-opt"
-WORKLOADS=(
-  "80 10 uniform balanced"
-  "80 10 zipfian zipf"
-  "90 5  uniform read_heavy"
-  "20 40 zipfian write_heavy"
-)
-
-echo "=== wormhole sweep (seconds=$SECONDS_PER_RUN warmup=$WARMUP) ==="
-for w in "${WORKLOADS[@]}"; do
-  set -- $w; rd=$1; ins=$2; dist=$3; lbl=$4
-  for lock in $LOCKS; do
-    bin="./build/wh_bench_${lock}"
-    if [ ! -x "$bin" ]; then
-      echo "missing: $bin (build first: cmake --build build)"
-      exit 1
-    fi
-    for t in $THREADS; do
-      $WRAP "$bin" --dist "$dist" --threads "$t" \
-        --seconds "$SECONDS_PER_RUN" --warmup "$WARMUP" \
-        --read_pct "$rd" --insert_pct "$ins" \
-        --csv "$WH_CSV" >/dev/null
-    done
-  done
-  echo "[wormhole] $lbl ($dist $rd/$ins/$((100-rd-ins)))"
+echo "=== wormhole sweep (arch=$LB_ARCH seconds=$SECONDS_PER_RUN warmup=$WARMUP repeats=$REPEATS) ==="
+for lock in $LOCKS; do
+  run_workload_matrix_on "./build/wh_bench_${lock}" "$WH_CSV"
 done
 echo "Done. CSV in $WH_CSV"

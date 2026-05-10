@@ -1013,3 +1013,80 @@ synchronization strategies**. We expose this via the `WH_FAIR_MM`
 CMake option; build with `cmake -DWH_FAIR_MM=ON`. The default build
 (`WH_FAIR_MM=OFF`) is reserved for studying the locked variants in
 their realistic configuration.
+
+
+## Counter-based rwlocks vs per-CPU rwlocks under wormhole's workload
+
+**TL;DR.** A semantically-correct rwlock is not the same as a *scalable* rwlock.
+Our `rw_lock` and wormhole's stock rwlock both let multiple readers hold the lock
+simultaneously — but both serialize the *acquire/release operations themselves*
+on a single shared cache line. For sub-100 ns critical sections, that
+cache-coherence ping-pong dominates and the reader-parallelism doesn't translate
+into throughput. The fix is a per-CPU rwlock: each thread owns its own counter
+on its own cache line.
+
+### Why our `wh-rw` results looked weak
+
+Initial wormhole comparisons showed `wh-rw` (our counter-based rwlock,
+`include/primitives/rw_lock.hpp:9-58`) failing to beat the spinlock variants
+(`wh-tas`, `wh-ttas`, `wh-cas`) on read-heavy workloads — surprising, since the
+rwlock semantically allows readers to overlap and the spinlocks don't.
+
+Two intertwined causes:
+
+1. **Lock-level (cache-coherence serialization).** `rw_lock::read_lock()` does a
+   CAS on a shared `state` counter; `read_unlock()` does a `fetch_sub` on the
+   same line. Every reader, on every acquire and every release, performs an RMW
+   on the **same** cache line. Cache coherence (MESI/MOESI) forces that line to
+   ping-pong between cores. Two readers on different cores cannot both do their
+   CAS in parallel; one waits for the other's coherence round-trip
+   (~30–100 ns on Xeon). For wormhole leaf lookups (~30–80 ns of useful work
+   inside the lock), this dominates total per-op cost and the rwlock collapses
+   to roughly TAS-spinlock throughput.
+2. **Workload-level (no reader-reader contention).** Default sweep settings
+   (`key_range=1M`, `prefill=500k`, uniform, 8 threads) put readers on
+   different leaves on essentially every operation. Even a perfect rwlock has
+   nothing to gain because there's no co-access to overlap.
+
+The first effect is intrinsic to counter-based rwlocks; this is the same
+limitation `std::shared_mutex` carries on most libstdc++ implementations and
+why production reader-scalable code uses RCU or per-CPU rwlocks. See Calciu
+et al. 2013, "NUMA-Aware Reader-Writer Locks" for the canonical analysis.
+
+### Decisions taken
+
+- **`wh-rw` is dropped from the wormhole comparison.** Wormhole's stock
+  `rwlock` (`wh-default`) already exemplifies a counter-based rwlock — swapping
+  in our `rw_lock` is redundant. The `rw_lock` primitive remains in the
+  lockbench microbenchmark for completeness.
+- **A per-CPU rwlock is added** as the new column `wh-pcpu-rw`. Implementation
+  in `include/primitives/pcpu_rw_lock.hpp`: an array of cache-line-aligned
+  reader counters (one per thread slot, allocated lazily via TLS), plus a
+  single writer-presence flag. Reader fast path touches only the thread's own
+  cache line. Writer slow path is O(N\_SLOTS) — flips the flag, then waits for
+  all slot counts to drain.
+- **Cache-regime workload matrix** added to `scripts/wh_compare.sh`: L1-resident
+  (`key_range=1k`, prefill=500) and L3-resident (`key_range=100k`,
+  prefill=50k), each crossed with cold uniform / warm zipf / hot zipf and with
+  read-heavy / write-heavy mixes. The DRAM-bound regime is excluded — memory
+  latency dominates and compresses lock differences toward zero.
+
+### Validation
+
+On a 4-thread macOS run (Apple M3, no SMT contention, 90% reads, sub-µs CS):
+
+| Lock variant            | ops/s    | ns/op |
+|-------------------------|---------:|------:|
+| `rw_lock` (counter)     |  30.7 M  |  32.6 |
+| `pcpu_rw_lock`          |  47.1 M  |  21.2 |
+
+`pcpu_rw_lock` is **53 % faster** than the counter-based rwlock at 4 threads
+even on Apple Silicon, where cross-core cache traffic is comparatively cheap.
+On 2-socket Xeon at higher thread counts the gap is expected to widen
+substantially because cross-socket coherence latency is much larger.
+
+### Caveat: per-leaf memory cost
+
+`pcpu_rw_lock` heap-allocates 64 cache-line-aligned slots = 4 KiB per
+instance. For wormhole's per-leaf locks (~3000 leaves at L3-resident scale)
+that's ~12 MiB extra heap. Documented; acceptable for the experiment.

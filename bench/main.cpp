@@ -21,6 +21,7 @@
 #include "../include/primitives/cas_lock.hpp"
 #include "../include/primitives/ticket_lock.hpp"
 #include "../include/primitives/rw_lock.hpp"
+#include "../include/primitives/pcpu_rw_lock.hpp"
 #include "../include/primitives/occ.hpp"
 #include "../include/primitives/rcu.hpp"
 
@@ -33,22 +34,48 @@ struct params {
   std::uint64_t cs_work = 0;         // busy_work iterations inside critical section
   int  read_pct         = 80;        // read percentage for rw / rcu workloads
   std::string csv_file;              // optional CSV output path
-  bool pin              = false;     // pin threads to cores (Linux only)
+  pin_policy pin = pin_policy::off;  // thread pinning policy (Linux only)
+  std::size_t stream_len = 1024;     // pre-rolled read/write coin-flip bitstream length (pow2)
 };
+
+// Round n up to next power of two, clamping min to 64.
+static inline std::size_t lb_round_up_pow2(std::size_t n) noexcept {
+  if (n < 64) n = 64;
+  std::size_t p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
+
+// Pre-roll an n-bit read/write decision mask. Bit i is 1 iff a fresh
+// mt19937 draw at position i would have satisfied dist(rng) < read_pct.
+// Statistically identical to the live coin flip; eliminates ~5-8 ns/op.
+static inline std::vector<std::uint64_t> make_rw_mask(int read_pct, std::size_t n_bits,
+                                                     std::uint64_t seed) {
+  std::vector<std::uint64_t> mask(n_bits / 64, 0);
+  std::mt19937 rng(static_cast<std::uint32_t>(seed));
+  std::uniform_int_distribution<int> dist(0, 99);
+  for (std::size_t i = 0; i < n_bits; ++i) {
+    if (dist(rng) < read_pct) mask[i >> 6] |= (std::uint64_t{1} << (i & 63));
+  }
+  return mask;
+}
 
 static void usage() {
   std::cout <<
     "Usage: lockbench [OPTIONS]\n"
     "\n"
     "Options:\n"
-    "  --lock <name>     Lock primitive (tas|ttas|cas|ticket|rw|occ|rcu)\n"
-    "  --workload <w>    Workload type (mutex|rw|rcu) [default: mutex]\n"
-    "  --threads  <N>    Number of worker threads [default: hw_concurrency]\n"
-    "  --seconds  <S>    Measurement duration in seconds [default: 3]\n"
-    "  --warmup   <S>    Warmup duration in seconds [default: 1]\n"
-    "  --cs_work  <N>    Busy-work loop iterations inside critical section [default: 0]\n"
-    "  --read_pct <P>    Read percentage for rw/rcu workloads (0-100) [default: 80]\n"
-    "  --csv      <file> Append results as CSV to file\n";
+    "  --lock <name>      Lock primitive (tas|ttas|cas|ticket|rw|occ|rcu)\n"
+    "  --workload <w>     Workload type (mutex|rw|rcu) [default: mutex]\n"
+    "  --threads  <N>     Number of worker threads [default: hw_concurrency]\n"
+    "  --seconds  <S>     Measurement duration in seconds [default: 3]\n"
+    "  --warmup   <S>     Warmup duration in seconds [default: 1]\n"
+    "  --cs_work  <N>     Busy-work loop iterations inside critical section [default: 0]\n"
+    "  --read_pct <P>     Read percentage for rw/rcu workloads (0-100) [default: 80]\n"
+    "  --csv      <file>  Append results as CSV to file\n"
+    "  --pin              Shorthand for --pin_policy compact_phys (Linux only)\n"
+    "  --pin_policy <p>   Pinning policy: off|linear|compact_phys|compact_socket [default: off]\n"
+    "  --stream_len <N>   Pre-rolled read/write mask length [default: 1024, rounded up to pow2]\n";
 }
 
 static params parse_args(int argc, char** argv) {
@@ -68,7 +95,9 @@ static params parse_args(int argc, char** argv) {
     else if (a == "--cs_work")  p.cs_work   = std::stoull(need("--cs_work"));
     else if (a == "--read_pct") p.read_pct  = std::stoi(need("--read_pct"));
     else if (a == "--csv")      p.csv_file  = need("--csv");
-    else if (a == "--pin")      p.pin       = true;
+    else if (a == "--pin")      p.pin       = pin_policy::compact_phys;
+    else if (a == "--pin_policy") p.pin     = parse_pin_policy(need("--pin_policy"));
+    else if (a == "--stream_len") p.stream_len = std::stoull(need("--stream_len"));
     else if (a == "--help" || a == "-h") { usage(); std::exit(0); }
     else { std::cerr << "Unknown arg: " << a << "\n"; std::exit(2); }
   }
@@ -76,6 +105,7 @@ static params parse_args(int argc, char** argv) {
   p.seconds = std::max(p.seconds, 1);
   p.warmup_seconds = std::max(p.warmup_seconds, 0);
   p.read_pct = std::clamp(p.read_pct, 0, 100);
+  p.stream_len = lb_round_up_pow2(p.stream_len);
   return p;
 }
 
@@ -146,12 +176,16 @@ static void print_result(const bench_result& r, const std::string& csv_file) {
 }
 
 // just lock/unlock in a loop
+// Two-phase pattern: phase 1 warmup is untimed and doesn't count; phase 2 starts after
+// all workers cross phase_b, then every iter counts. Stop is checked every 64 iters
+// to keep it out of the per-op hot path.
 template <class Lock>
 static void bench_mutex(const params& p, const char* label) {
   Lock lock;
   std::atomic<bool> stop{false};
-  std::atomic<bool> measuring{false};
-  start_barrier barrier(p.threads);
+  std::atomic<bool> warmup_done{false};
+  start_barrier start_b(p.threads);
+  start_barrier phase_b(p.threads);
 
   std::vector<std::uint64_t> counts(p.threads, 0);
   std::vector<std::thread> workers;
@@ -160,28 +194,44 @@ static void bench_mutex(const params& p, const char* label) {
   for (int t = 0; t < p.threads; ++t) {
     workers.emplace_back([&, t] {
       setup_worker_thread(t, p.pin);
-      barrier.arrive_and_wait();
-      std::uint64_t local = 0;
-      while (!stop.load(std::memory_order_relaxed)) {
+      start_b.arrive_and_wait();
+
+      // Phase 1: warmup, untimed.
+      while (!warmup_done.load(std::memory_order_relaxed)) {
         lock.lock();
         if (p.cs_work) busy_work(p.cs_work);
         lock.unlock();
-        if (measuring.load(std::memory_order_relaxed)) ++local;
+      }
+      phase_b.arrive_and_wait();
+
+      // Phase 2: measurement; every iter counts, stop checked every 64 iters.
+      std::uint64_t local = 0;
+      for (;;) {
+        for (int k = 0; k < 64; ++k) {
+          lock.lock();
+          if (p.cs_work) busy_work(p.cs_work);
+          lock.unlock();
+          ++local;
+        }
+        if (stop.load(std::memory_order_relaxed)) break;
       }
       counts[t] = local;
     });
   }
 
-  barrier.wait_all_arrived();
-  barrier.release();
+  start_b.wait_all_arrived();
+  start_b.release();
 
   if (p.warmup_seconds > 0)
     std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
+  warmup_done.store(true, std::memory_order_release);
 
-  measuring.store(true, std::memory_order_relaxed);
+  phase_b.wait_all_arrived();
   auto t0 = std::chrono::steady_clock::now();
+  phase_b.release();
+
   std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
-  stop.store(true, std::memory_order_relaxed);
+  stop.store(true, std::memory_order_release);
   for (auto& th : workers) th.join();
   auto t1 = std::chrono::steady_clock::now();
 
@@ -194,11 +244,14 @@ static void bench_mutex(const params& p, const char* label) {
 }
 
 // rw lock benchmark - readers and writers on a shared counter
+// Two-phase pattern; see bench_mutex for the design.
+template <class RwLock>
 static void bench_rw(const params& p, const char* label) {
-  rw_lock lock;
+  RwLock lock;
   std::atomic<bool> stop{false};
-  std::atomic<bool> measuring{false};
-  start_barrier barrier(p.threads);
+  std::atomic<bool> warmup_done{false};
+  start_barrier start_b(p.threads);
+  start_barrier phase_b(p.threads);
 
   alignas(64) std::uint64_t shared_data = 0;
 
@@ -210,41 +263,75 @@ static void bench_rw(const params& p, const char* label) {
   for (int t = 0; t < p.threads; ++t) {
     workers.emplace_back([&, t] {
       setup_worker_thread(t, p.pin);
-      barrier.arrive_and_wait();
-      std::mt19937 rng(t + 42);
-      std::uniform_int_distribution<int> dist(0, 99);
-      std::uint64_t local_reads = 0, local_writes = 0;
 
-      while (!stop.load(std::memory_order_relaxed)) {
-        if (dist(rng) < p.read_pct) {
+      // Pre-rolled read/write coin flip; eliminates mt19937 cost from hot path.
+      const std::vector<std::uint64_t> rw_mask =
+          make_rw_mask(p.read_pct, p.stream_len, static_cast<std::uint64_t>(t) + 42);
+      const std::size_t bit_mask = p.stream_len - 1;
+      std::size_t idx = (static_cast<std::size_t>(t) * (p.stream_len / static_cast<std::size_t>(std::max(p.threads, 1)))) & bit_mask;
+
+      start_b.arrive_and_wait();
+
+      auto is_read = [&]() {
+        bool r = (rw_mask[idx >> 6] >> (idx & 63)) & 1ULL;
+        idx = (idx + 1) & bit_mask;
+        return r;
+      };
+
+      // Phase 1: warmup, untimed.
+      while (!warmup_done.load(std::memory_order_relaxed)) {
+        if (is_read()) {
           lock.read_lock();
           if (p.cs_work) busy_work(p.cs_work);
           volatile std::uint64_t sink = shared_data; (void)sink;
           lock.read_unlock();
-          if (measuring.load(std::memory_order_relaxed)) ++local_reads;
         } else {
           lock.write_lock();
           if (p.cs_work) busy_work(p.cs_work);
           ++shared_data;
           lock.write_unlock();
-          if (measuring.load(std::memory_order_relaxed)) ++local_writes;
         }
+      }
+      phase_b.arrive_and_wait();
+
+      // Phase 2: measurement; every iter counts, stop checked every 64 iters.
+      std::uint64_t local_reads = 0, local_writes = 0;
+      for (;;) {
+        for (int k = 0; k < 64; ++k) {
+          if (is_read()) {
+            lock.read_lock();
+            if (p.cs_work) busy_work(p.cs_work);
+            volatile std::uint64_t sink = shared_data; (void)sink;
+            lock.read_unlock();
+            ++local_reads;
+          } else {
+            lock.write_lock();
+            if (p.cs_work) busy_work(p.cs_work);
+            ++shared_data;
+            lock.write_unlock();
+            ++local_writes;
+          }
+        }
+        if (stop.load(std::memory_order_relaxed)) break;
       }
       stats[t].reads  = local_reads;
       stats[t].writes = local_writes;
     });
   }
 
-  barrier.wait_all_arrived();
-  barrier.release();
+  start_b.wait_all_arrived();
+  start_b.release();
 
   if (p.warmup_seconds > 0)
     std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
+  warmup_done.store(true, std::memory_order_release);
 
-  measuring.store(true, std::memory_order_relaxed);
+  phase_b.wait_all_arrived();
   auto t0 = std::chrono::steady_clock::now();
+  phase_b.release();
+
   std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
-  stop.store(true, std::memory_order_relaxed);
+  stop.store(true, std::memory_order_release);
   for (auto& th : workers) th.join();
   auto t1 = std::chrono::steady_clock::now();
 
@@ -262,11 +349,13 @@ static void bench_rw(const params& p, const char* label) {
 }
 
 // same thing but with OCC - readers don't take a lock, just validate after
+// Two-phase pattern; see bench_mutex for the design.
 static void bench_occ_rw(const params& p, const char* label) {
   occ_lock lock;
   std::atomic<bool> stop{false};
-  std::atomic<bool> measuring{false};
-  start_barrier barrier(p.threads);
+  std::atomic<bool> warmup_done{false};
+  start_barrier start_b(p.threads);
+  start_barrier phase_b(p.threads);
 
   // must be atomic to avoid data-race UB in the C++ memory model:
   // readers load shared_data speculatively (before validation), so a
@@ -282,46 +371,67 @@ static void bench_occ_rw(const params& p, const char* label) {
   for (int t = 0; t < p.threads; ++t) {
     workers.emplace_back([&, t] {
       setup_worker_thread(t, p.pin);
-      barrier.arrive_and_wait();
-      std::mt19937 rng(t + 42);
-      std::uniform_int_distribution<int> dist(0, 99);
-      std::uint64_t local_reads = 0, local_writes = 0;
 
-      while (!stop.load(std::memory_order_relaxed)) {
-        if (dist(rng) < p.read_pct) {
+      const std::vector<std::uint64_t> rw_mask =
+          make_rw_mask(p.read_pct, p.stream_len, static_cast<std::uint64_t>(t) + 42);
+      const std::size_t bit_mask = p.stream_len - 1;
+      std::size_t idx = (static_cast<std::size_t>(t) * (p.stream_len / static_cast<std::size_t>(std::max(p.threads, 1)))) & bit_mask;
+
+      start_b.arrive_and_wait();
+
+      auto do_op = [&]() {
+        bool is_read = (rw_mask[idx >> 6] >> (idx & 63)) & 1ULL;
+        idx = (idx + 1) & bit_mask;
+        if (is_read) {
           std::uint64_t val;
-          do {
+          for (;;) {
             auto v = lock.read_begin();
             val = shared_data.load(std::memory_order_relaxed);
             if (p.cs_work) busy_work(p.cs_work);
             if (lock.read_validate(v)) break;
-          } while (true);
+          }
           volatile std::uint64_t sink = val; (void)sink;
-          if (measuring.load(std::memory_order_relaxed)) ++local_reads;
+          return 0; // read
         } else {
           lock.write_lock();
           if (p.cs_work) busy_work(p.cs_work);
           shared_data.store(shared_data.load(std::memory_order_relaxed) + 1,
                             std::memory_order_relaxed);
           lock.write_unlock();
-          if (measuring.load(std::memory_order_relaxed)) ++local_writes;
+          return 1; // write
         }
+      };
+
+      // Phase 1: warmup, untimed.
+      while (!warmup_done.load(std::memory_order_relaxed)) (void)do_op();
+      phase_b.arrive_and_wait();
+
+      // Phase 2: measurement; every iter counts, stop checked every 64 iters.
+      std::uint64_t local_reads = 0, local_writes = 0;
+      for (;;) {
+        for (int k = 0; k < 64; ++k) {
+          if (do_op() == 0) ++local_reads; else ++local_writes;
+        }
+        if (stop.load(std::memory_order_relaxed)) break;
       }
       stats[t].reads  = local_reads;
       stats[t].writes = local_writes;
     });
   }
 
-  barrier.wait_all_arrived();
-  barrier.release();
+  start_b.wait_all_arrived();
+  start_b.release();
 
   if (p.warmup_seconds > 0)
     std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
+  warmup_done.store(true, std::memory_order_release);
 
-  measuring.store(true, std::memory_order_relaxed);
+  phase_b.wait_all_arrived();
   auto t0 = std::chrono::steady_clock::now();
+  phase_b.release();
+
   std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
-  stop.store(true, std::memory_order_relaxed);
+  stop.store(true, std::memory_order_release);
   for (auto& th : workers) th.join();
   auto t1 = std::chrono::steady_clock::now();
 
@@ -339,11 +449,13 @@ static void bench_occ_rw(const params& p, const char* label) {
 }
 
 // RCU benchmark - readers announce their epoch, writers swap a pointer and wait
+// Two-phase pattern; see bench_mutex for the design.
 static void bench_rcu(const params& p, const char* label) {
   epoch_rcu rcu(p.threads);
   std::atomic<bool> stop{false};
-  std::atomic<bool> measuring{false};
-  start_barrier barrier(p.threads);
+  std::atomic<bool> warmup_done{false};
+  start_barrier start_b(p.threads);
+  start_barrier phase_b(p.threads);
 
   alignas(64) std::atomic<std::uint64_t*> data_ptr{new std::uint64_t(0)};
 
@@ -358,19 +470,24 @@ static void bench_rcu(const params& p, const char* label) {
   for (int t = 0; t < p.threads; ++t) {
     workers.emplace_back([&, t] {
       setup_worker_thread(t, p.pin);
-      barrier.arrive_and_wait();
-      std::mt19937 rng(t + 42);
-      std::uniform_int_distribution<int> dist(0, 99);
 
-      std::uint64_t local_reads = 0, local_writes = 0;
-      while (!stop.load(std::memory_order_relaxed)) {
-        if (dist(rng) < p.read_pct) {
+      const std::vector<std::uint64_t> rw_mask =
+          make_rw_mask(p.read_pct, p.stream_len, static_cast<std::uint64_t>(t) + 42);
+      const std::size_t bit_mask = p.stream_len - 1;
+      std::size_t idx = (static_cast<std::size_t>(t) * (p.stream_len / static_cast<std::size_t>(std::max(p.threads, 1)))) & bit_mask;
+
+      start_b.arrive_and_wait();
+
+      auto do_op = [&]() {
+        bool is_read = (rw_mask[idx >> 6] >> (idx & 63)) & 1ULL;
+        idx = (idx + 1) & bit_mask;
+        if (is_read) {
           rcu.read_lock(t);
           std::uint64_t* ptr = data_ptr.load(std::memory_order_acquire);
           volatile std::uint64_t sink = *ptr; (void)sink;
           if (p.cs_work) busy_work(p.cs_work);
           rcu.read_unlock(t);
-          if (measuring.load(std::memory_order_relaxed)) ++local_reads;
+          return 0; // read
         } else {
           writer_lock.lock();
           std::uint64_t* old = data_ptr.load(std::memory_order_relaxed);
@@ -380,24 +497,40 @@ static void bench_rcu(const params& p, const char* label) {
           delete old;
           if (p.cs_work) busy_work(p.cs_work);
           writer_lock.unlock();
-          if (measuring.load(std::memory_order_relaxed)) ++local_writes;
+          return 1; // write
         }
+      };
+
+      // Phase 1: warmup, untimed.
+      while (!warmup_done.load(std::memory_order_relaxed)) (void)do_op();
+      phase_b.arrive_and_wait();
+
+      // Phase 2: measurement; every iter counts, stop checked every 64 iters.
+      std::uint64_t local_reads = 0, local_writes = 0;
+      for (;;) {
+        for (int k = 0; k < 64; ++k) {
+          if (do_op() == 0) ++local_reads; else ++local_writes;
+        }
+        if (stop.load(std::memory_order_relaxed)) break;
       }
       stats[t].reads  = local_reads;
       stats[t].writes = local_writes;
     });
   }
 
-  barrier.wait_all_arrived();
-  barrier.release();
+  start_b.wait_all_arrived();
+  start_b.release();
 
   if (p.warmup_seconds > 0)
     std::this_thread::sleep_for(std::chrono::seconds(p.warmup_seconds));
+  warmup_done.store(true, std::memory_order_release);
 
-  measuring.store(true, std::memory_order_relaxed);
+  phase_b.wait_all_arrived();
   auto t0 = std::chrono::steady_clock::now();
+  phase_b.release();
+
   std::this_thread::sleep_for(std::chrono::seconds(p.seconds));
-  stop.store(true, std::memory_order_relaxed);
+  stop.store(true, std::memory_order_release);
   for (auto& th : workers) th.join();
   auto t1 = std::chrono::steady_clock::now();
 
@@ -420,23 +553,25 @@ int main(int argc, char** argv) {
   params p = parse_args(argc, argv);
 
   if (p.workload == "mutex") {
-    if      (p.lock_name == "tas")    bench_mutex<tas_lock>(p, "tas");
-    else if (p.lock_name == "ttas")   bench_mutex<ttas_lock>(p, "ttas");
-    else if (p.lock_name == "cas")    bench_mutex<cas_lock>(p, "cas");
-    else if (p.lock_name == "ticket") bench_mutex<ticket_lock>(p, "ticket");
-    else if (p.lock_name == "rw")     bench_mutex<rw_lock>(p, "rw");
-    else if (p.lock_name == "occ")    bench_mutex<occ_lock>(p, "occ");
+    if      (p.lock_name == "tas")     bench_mutex<tas_lock>(p, "tas");
+    else if (p.lock_name == "ttas")    bench_mutex<ttas_lock>(p, "ttas");
+    else if (p.lock_name == "cas")     bench_mutex<cas_lock>(p, "cas");
+    else if (p.lock_name == "ticket")  bench_mutex<ticket_lock>(p, "ticket");
+    else if (p.lock_name == "rw")      bench_mutex<rw_lock>(p, "rw");
+    else if (p.lock_name == "pcpu-rw") bench_mutex<pcpu_rw_lock>(p, "pcpu-rw");
+    else if (p.lock_name == "occ")     bench_mutex<occ_lock>(p, "occ");
     else {
       std::cerr << "Unsupported --lock " << p.lock_name
-                << " for mutex workload (use tas|ttas|cas|ticket|rw|occ)\n";
+                << " for mutex workload (use tas|ttas|cas|ticket|rw|pcpu-rw|occ)\n";
       return 2;
     }
   } else if (p.workload == "rw") {
-    if      (p.lock_name == "rw")  bench_rw(p, "rw");
-    else if (p.lock_name == "occ") bench_occ_rw(p, "occ");
+    if      (p.lock_name == "rw")      bench_rw<rw_lock>(p, "rw");
+    else if (p.lock_name == "pcpu-rw") bench_rw<pcpu_rw_lock>(p, "pcpu-rw");
+    else if (p.lock_name == "occ")     bench_occ_rw(p, "occ");
     else {
       std::cerr << "Unsupported --lock " << p.lock_name
-                << " for rw workload (use rw|occ)\n";
+                << " for rw workload (use rw|pcpu-rw|occ)\n";
       return 2;
     }
   } else if (p.workload == "rcu") {

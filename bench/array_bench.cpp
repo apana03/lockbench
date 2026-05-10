@@ -33,7 +33,7 @@ struct params {
   std::uint64_t cs_work  = 0;          // busy_work iterations inside CS
   int    read_pct        = 80;         // read/write split for rw/occ locks
   std::string csv_file;
-  bool pin              = false;     // pin threads to cores (Linux only)
+  pin_policy pin = pin_policy::off;  // thread pinning policy (Linux only)
 };
 
 static void usage() {
@@ -48,6 +48,8 @@ static void usage() {
     "  --num_locks <N>     Number of locks in the array [default: 64]\n"
     "  --cs_work <N>       Busy-work loop iterations inside critical section [default: 0]\n"
     "  --read_pct <P>      Read percentage for rw/occ locks (0-100) [default: 80]\n"
+    "  --pin               Shorthand for --pin_policy compact_phys (Linux only)\n"
+    "  --pin_policy <p>    Pinning policy: off|linear|compact_phys|compact_socket\n"
     "  --csv <file>        Append results as CSV to file\n";
 }
 
@@ -67,7 +69,8 @@ static params parse_args(int argc, char** argv) {
     else if (a == "--cs_work")    p.cs_work       = std::stoull(need("--cs_work"));
     else if (a == "--read_pct")   p.read_pct      = std::stoi(need("--read_pct"));
     else if (a == "--csv")        p.csv_file      = need("--csv");
-    else if (a == "--pin")        p.pin           = true;
+    else if (a == "--pin")        p.pin           = pin_policy::compact_phys;
+    else if (a == "--pin_policy") p.pin           = parse_pin_policy(need("--pin_policy"));
     else if (a == "--help" || a == "-h") { usage(); std::exit(0); }
     else { std::cerr << "Unknown arg: " << a << "\n"; std::exit(2); }
   }

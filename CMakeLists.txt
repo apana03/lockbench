@@ -11,6 +11,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Useful for benchmarks
 add_compile_options(-O3)
 
+# Probe for LTO/IPO support; we enable it on the wormhole shim path below so
+# rwlock_lock_read et al. inline across the C↔C++ boundary into wh.c call
+# sites. Without LTO every read op pays a real `call` to the shim wrapper.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT _IPO_OK OUTPUT _IPO_OUT)
+if (NOT _IPO_OK)
+  message(STATUS "IPO/LTO not supported: ${_IPO_OUT}")
+endif()
+
 find_package(Threads REQUIRED)
 
 # --- lockbench: raw lock/unlock micro-benchmarks ---
@@ -107,10 +116,15 @@ set(WH_C_SRCS
 # occ-opt is a special variant: same write-side as cas, but enables
 # WH_OCC_OPTIMISTIC in wh.c — readers walk the leaf without the leaflock
 # and validate via a per-leaf seqlock counter. See plan/EXPERIMENT.md.
-set(WH_LOCKS default rw tas ttas cas occ occ-opt)
+#
+# pcpu-rw is a per-CPU rwlock: reader-scalable in practice (each thread
+# uses its own cache line), unlike `rw` whose CAS-on-shared-counter design
+# matches wormhole's `default` rwlock. See docs/INDEX_LOCK_DECISIONS.md (D9).
+set(WH_LOCKS default rw tas ttas cas occ occ-opt pcpu-rw)
 
 foreach(lk IN LISTS WH_LOCKS)
   string(TOUPPER "${lk}" LK_UPPER)
+  string(REPLACE "-" "_" LK_MACRO "${LK_UPPER}")  # pcpu-rw → PCPU_RW for the C macro
   set(libname wormhole-rt-${lk})
   if (lk STREQUAL "default")
     add_library(${libname} STATIC ${WH_C_SRCS})
@@ -122,7 +136,7 @@ foreach(lk IN LISTS WH_LOCKS)
   else()
     add_library(${libname} STATIC ${WH_C_SRCS}
         third_party/wormhole/wh_lock_shim.cpp)
-    target_compile_definitions(${libname} PUBLIC WH_LOCK_SHIM WH_LOCK_${LK_UPPER})
+    target_compile_definitions(${libname} PUBLIC WH_LOCK_SHIM WH_LOCK_${LK_MACRO})
   endif()
   target_include_directories(${libname} PUBLIC
       third_party/wormhole include)
@@ -168,6 +182,16 @@ foreach(lk IN LISTS WH_LOCKS)
   if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(wh_bench_${lk} PRIVATE -march=native -fno-omit-frame-pointer)
     target_compile_options(wh_test_${lk}  PRIVATE -march=native -fno-omit-frame-pointer)
+  endif()
+
+  # Enable LTO so wh_lock_shim.cpp's `rwlock_lock_read` etc. can inline into
+  # wh.c call sites. The shim wrappers are one-line forwarders to the real
+  # lock body; without LTO they become a real `call` per op. We confirmed
+  # this is the case via `nm build/.../wh.c.o | grep rwlock`.
+  if (_IPO_OK AND NOT lk STREQUAL "default")
+    set_property(TARGET ${libname} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set_property(TARGET wh_bench_${lk} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set_property(TARGET wh_test_${lk}  PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
   endif()
 endforeach()
 
