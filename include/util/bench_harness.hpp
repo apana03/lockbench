@@ -173,12 +173,14 @@ inline void print_bench_result(const char* label, const params& p, double secs,
     // Cache arch+hostname (cheap, but no need to re-query per row).
     static const std::string arch = detect_arch();
     static const std::string host = detect_hostname();
-    std::string header = "arch;hostname;lock;dist;zipf_theta;threads;buckets;key_range;read_pct;insert_pct;delete_pct;total_ops;gets;puts;removes;ops_s;ns_op;fairness_min;fairness_max;fairness_ratio";
+    std::string header = "arch;hostname;lock;dist;zipf_theta;threads;buckets;key_range;prefill;stream_len;read_pct;insert_pct;delete_pct;total_ops;gets;puts;removes;ops_s;ns_op;fairness_min;fairness_max;fairness_ratio";
     std::ostringstream row;
     row << arch << ";" << host << ";"
         << label << ";" << p.dist << ";" << fmt_double(p.zipf_theta) << ";"
         << p.threads << ";"
-        << p.num_buckets << ";" << p.key_range << ";" << p.read_pct << ";"
+        << p.num_buckets << ";" << p.key_range << ";" << p.prefill << ";"
+        << p.stream_len << ";"
+        << p.read_pct << ";"
         << p.insert_pct << ";" << delete_pct << ";"
         << total << ";" << total_gets << ";" << total_puts << ";"
         << total_rems << ";" << static_cast<std::uint64_t>(ops_s) << ";"

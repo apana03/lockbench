@@ -259,3 +259,26 @@ The microbench gain is small because the live `mt19937 + uniform_int(0,99)` was 
 - The `--stream_len <N>` knob is exposed for empirical validation: a flat-region test across `N ∈ {1024, 4096, 16384}` should show throughput stable within ±2 %.
 
 **Files changed.** `include/util/op_stream.hpp` (new); `include/util/bench_harness.hpp` (params field, parser, `run_bench_common` body); `bench/main.cpp` (params field, parser, `make_rw_mask`, three worker lambdas).
+
+## 2026-05-10 — D22 follow-up: Xeon flat-region check + CSV columns
+
+### Flat-region check on Xeon E5-2650L v3 (no longer macOS-noisy)
+
+Ran `wh_bench_pcpu-rw --threads 12 --seconds 10 --warmup 2 --read_pct 90 --insert_pct 5 --dist uniform --key_range 100000 --prefill 50000 --pin_policy compact_phys` with three stream lengths × 3 trials each:
+
+| stream_len | bytes / thread | trials (M ops/s)        | median ns/op | landing |
+| ---: | ---: | --- | ---: | --- |
+| 1024  | 16 KiB | 87.96, 87.62, 87.39 | **11.4** | fits in L1d (32 KiB Haswell-EP) |
+| 4096  | 64 KiB | 81.05, 80.74, 80.66 | 12.4 | fits in L2 (256 KiB) |
+| 16384 | 256 KiB | 77.25, 77.34, 77.47 | 12.9 | at L2 boundary |
+
+**Within each stream_len, variance is < 1%** (12 threads × `compact_phys` pinning works as intended — the noise we saw on macOS was entirely M3 P/E-core scheduling, not a stream-design issue). Between stream_lens, there is a **real 12 % cache-fit step**: smaller streams stay in higher cache and the stream walk is ~1 ns/op cheaper.
+
+The flat-region assumption from the initial D22 was wrong on Xeon. Updated framing:
+
+- The cost is real but it's a **uniform shift across all lock variants** consuming the same `stream_len`, so lock-vs-lock comparisons remain valid at any choice.
+- **Decision: keep `stream_len = 4096` default.** At θ=1.5, 1024 samples is coarse enough that the second-tier hot keys' empirical mass has visible variance; 4096 gives a better statistical fidelity ↔ throughput trade-off. If the goal is max absolute throughput on Xeon and high-skew workloads aren't a concern, `--stream_len 1024` is a valid override (gains ~10 %).
+
+### CSV columns: `stream_len`, `prefill` now emitted per row
+
+The flat-region check above initially collapsed all 9 trials into one aggregate row because `stream_len` wasn't in the header. Fixed: `print_bench_result` in `include/util/bench_harness.hpp` now emits `stream_len` and `prefill` as additional columns. `scripts/aggregate.py` picks them up automatically because they aren't in `NON_KEY_COLUMNS` (any column not in that set becomes a grouping key). Backward-compat: old CSVs without these columns still aggregate correctly (the DictReader returns empty strings for missing keys, which group together).
