@@ -34,7 +34,7 @@ WH_CSV="$OUT_DIR/wh.csv"
 mkdir -p "$OUT_DIR"
 rm -f "$WH_CSV"
 
-LOCKS="default tas ttas cas occ occ-opt pcpu-rw"
+LOCKS="default tas ttas cas occ occ-opt pcpu-rw pcpu-rw-v2"
 
 echo "=== wormhole sweep (arch=$LB_ARCH seconds=$SECONDS_PER_RUN warmup=$WARMUP repeats=$REPEATS) ==="
 for lock in $LOCKS; do

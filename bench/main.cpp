@@ -22,6 +22,7 @@
 #include "../include/primitives/ticket_lock.hpp"
 #include "../include/primitives/rw_lock.hpp"
 #include "../include/primitives/pcpu_rw_lock.hpp"
+#include "../include/primitives/pcpu_rw_lock_v2.hpp"
 #include "../include/primitives/occ.hpp"
 #include "../include/primitives/rcu.hpp"
 
@@ -558,20 +559,22 @@ int main(int argc, char** argv) {
     else if (p.lock_name == "cas")     bench_mutex<cas_lock>(p, "cas");
     else if (p.lock_name == "ticket")  bench_mutex<ticket_lock>(p, "ticket");
     else if (p.lock_name == "rw")      bench_mutex<rw_lock>(p, "rw");
-    else if (p.lock_name == "pcpu-rw") bench_mutex<pcpu_rw_lock>(p, "pcpu-rw");
+    else if (p.lock_name == "pcpu-rw")    bench_mutex<pcpu_rw_lock>(p, "pcpu-rw");
+    else if (p.lock_name == "pcpu-rw-v2") bench_mutex<pcpu_rw_lock_v2>(p, "pcpu-rw-v2");
     else if (p.lock_name == "occ")     bench_mutex<occ_lock>(p, "occ");
     else {
       std::cerr << "Unsupported --lock " << p.lock_name
-                << " for mutex workload (use tas|ttas|cas|ticket|rw|pcpu-rw|occ)\n";
+                << " for mutex workload (use tas|ttas|cas|ticket|rw|pcpu-rw|pcpu-rw-v2|occ)\n";
       return 2;
     }
   } else if (p.workload == "rw") {
-    if      (p.lock_name == "rw")      bench_rw<rw_lock>(p, "rw");
-    else if (p.lock_name == "pcpu-rw") bench_rw<pcpu_rw_lock>(p, "pcpu-rw");
-    else if (p.lock_name == "occ")     bench_occ_rw(p, "occ");
+    if      (p.lock_name == "rw")         bench_rw<rw_lock>(p, "rw");
+    else if (p.lock_name == "pcpu-rw")    bench_rw<pcpu_rw_lock>(p, "pcpu-rw");
+    else if (p.lock_name == "pcpu-rw-v2") bench_rw<pcpu_rw_lock_v2>(p, "pcpu-rw-v2");
+    else if (p.lock_name == "occ")        bench_occ_rw(p, "occ");
     else {
       std::cerr << "Unsupported --lock " << p.lock_name
-                << " for rw workload (use rw|pcpu-rw|occ)\n";
+                << " for rw workload (use rw|pcpu-rw|pcpu-rw-v2|occ)\n";
       return 2;
     }
   } else if (p.workload == "rcu") {

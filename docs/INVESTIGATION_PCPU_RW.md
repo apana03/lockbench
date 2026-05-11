@@ -1,6 +1,6 @@
 # Investigation — `pcpu_rw_lock` collapse on Graviton2
 
-**Status:** diagnosis confirmed; fix design pending implementation. ↗ See also `docs/INDEX_LOCK_DECISIONS.md` D9 (introduction of the primitive) and the post-implementation findings appended to D22.
+**Status:** diagnosis confirmed; fix prototype (`pcpu_rw_lock_v2`) implemented and passing correctness; awaiting Graviton validation. ↗ See also `docs/INDEX_LOCK_DECISIONS.md` D9 (introduction of the primitive), the post-implementation findings appended to D22, and D24 (collapse diagnosis).
 
 This is a running journal. Each section is timestamped; later sections may update or supersede earlier conclusions. Append new findings — don't rewrite old ones.
 
@@ -126,7 +126,7 @@ Likely buys us back to "matches `wh-default`" — not a structural fix, but a on
 - [x] **0c — microbench check.** Done; confirms the lock primitive fails on its own, with wormhole providing ~86× amplification. See the section below.
 - [ ] **`perf stat` on Graviton2 under collapse mode** — confirm cycles are spent in atomic stalls (`stall_backend`) vs cache misses vs idle spinning. Predicted: high `stall_backend`, moderate cache-misses.
 - [ ] **ThreadSanitizer build** to rule out a latent data race in `my_slot()` or `slots[]` allocation that's mostly invisible under x86 TSO.
-- [ ] **Prototype Option A** as `pcpu_rw_lock_v2` (parallel primitive in `include/primitives/`). Wire into the wormhole shim as a separate `wh-pcpu-rw-v2` build, sweep the same matrix, compare directly.
+- [x] **Prototype Option A** as `pcpu_rw_lock_v2`. Done — see the v2 section below. Awaiting Graviton validation run.
 - [ ] **Cross-check on Xeon.** Xeon at 8–12T does the same collapse, just at a different threshold. Once Option A is in, run both arches to verify the fix isn't aarch64-specific.
 
 ## Cross-reference
@@ -195,3 +195,58 @@ This is consistent with the **86× amplification** number: roughly (2 locks) × 
 The lock primitive is the root cause; wormhole is the amplifier. **Fixing the primitive will improve both benchmarks** — the microbench will recover most of its 1T throughput (likely 50+ M ops/s at 6T) and wormhole will benefit even more because long writer CSes will no longer cause reader thrashing.
 
 → Diagnosis closed. The remaining work is the fix prototype (Option A in the earlier section). Confidence is high enough to commit to the fix path without running 3a–3e first.
+
+---
+
+## 2026-05-11 — Fix prototype: `pcpu_rw_lock_v2` (Option A)
+
+Implemented Linux `percpu_rwsem`-style protocol as a parallel primitive — same per-thread slot infrastructure, different writer–reader handshake. The slow path queues readers on `std::mutex` (futex-backed on Linux) instead of spinning on `writer_pending`. Wake-up is serialised by the mutex queue, breaking the herd.
+
+**Files:**
+- `include/primitives/pcpu_rw_lock_v2.hpp` — new primitive with full design rationale in header comment.
+- `third_party/wormhole/wh_lock_shim.cpp` — instantiates v2 behind `WH_LOCK_PCPU_RW_V2`.
+- `CMakeLists.txt` — adds `pcpu-rw-v2` to `WH_LOCKS` (build target: `wh_bench_pcpu-rw-v2`, `wh_test_pcpu-rw-v2`).
+- `bench/main.cpp` — accepts `--lock pcpu-rw-v2` for microbench.
+- `bench/lock_test.cpp` — templated correctness tests now cover both v1 and v2.
+- `scripts/wh_compare.sh` — adds `pcpu-rw-v2` to the swept lock list.
+
+**Correctness:** `locktest --threads 4 --loops 100000` passes both write-side mutual-exclusion and mixed-read/write torn-read tests for v2. `wh_test_pcpu-rw-v2` (8 threads × 20 000 ops race test) passes.
+
+**Smoke test on macOS** (no pinning, just scheduling noise as the variance source — directional indicator only):
+
+| threads | v1 (M ops/s) | v2 (M ops/s) | v2/v1 |
+| ---: | ---: | ---: | ---: |
+| 1 | 184.1 | 175.3 | 0.95× |
+| 2 | 75.3 | 92.0 | 1.22× |
+| 4 | 45.5 | 64.6 | 1.42× |
+| 6 | 17.0 | 38.6 | 2.27× |
+| 8 | 13.9 | 25.9 | 1.86× |
+
+v2 trades a slight 1T cost (~5 %, the extra mutex bookkeeping isn't free even when uncontended) for substantially better high-thread behaviour. The improvement grows with thread count, exactly as predicted: at 1T there's no herd to break; at 6T the herd is what's bottlenecking v1, and v2's queue-on-mutex protocol avoids it.
+
+**Predicted on Graviton (clean pinning, no scheduling jitter):**
+- 1T: v2 within ±3 % of v1 (mutex overhead is small).
+- 4T: v2 should match `wh-default` or better (~20+ M ops/s on `L1_warm_zipf99 90/5/5`, vs v1's 4.9 M).
+- 8T: v2 should be a multi-× improvement over v1's 0.03 M ops/s on the same cell.
+
+Validation commands for the Graviton box:
+
+```bash
+git pull
+cmake --build build -j$(nproc)
+./build/locktest --threads 4 --loops 100000  # correctness, both v1+v2
+
+# Triage: thread sweep, v1 vs v2 head-to-head, 90/5/5 L1_warm_zipf99
+for lock in pcpu-rw pcpu-rw-v2; do
+  for t in 1 2 3 4 5 6 8; do
+    for r in 1 2 3; do
+      ./build/wh_bench_$lock --threads $t --seconds 5 --warmup 2 \
+        --dist zipfian --zipf_theta 0.99 --key_range 1000 --prefill 500 \
+        --read_pct 90 --insert_pct 5 --pin_policy compact_phys 2>/dev/null \
+        | grep ops_s
+    done
+  done
+done
+```
+
+If the v2 curve climbs through 8T instead of collapsing, the diagnosis-to-fix loop is closed. After that, re-running the full `scripts/wh_compare.sh` will give us comparable cross-arch v1/v2 data for the notebook.

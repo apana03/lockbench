@@ -10,6 +10,7 @@
 
 #include "primitives/rw_lock.hpp"
 #include "primitives/pcpu_rw_lock.hpp"
+#include "primitives/pcpu_rw_lock_v2.hpp"
 #include "primitives/tas_lock.hpp"
 #include "primitives/ttas_lock.hpp"
 #include "primitives/cas_lock.hpp"
@@ -21,6 +22,8 @@
   static constexpr bool kIsRw = true;
 #elif defined(WH_LOCK_PCPU_RW)
   using LockT = pcpu_rw_lock; static constexpr bool kIsRw = true;
+#elif defined(WH_LOCK_PCPU_RW_V2)
+  using LockT = pcpu_rw_lock_v2; static constexpr bool kIsRw = true;
 #elif defined(WH_LOCK_TAS)
   using LockT = tas_lock;     static constexpr bool kIsRw = false;
 #elif defined(WH_LOCK_TTAS)
@@ -50,7 +53,7 @@ template <class L>
 static inline bool try_excl(L* lk) {
     if constexpr (std::is_same_v<L, rw_lock>) {
         return lk->try_write_lock();
-    } else if constexpr (std::is_same_v<L, pcpu_rw_lock>) {
+    } else if constexpr (std::is_same_v<L, pcpu_rw_lock> || std::is_same_v<L, pcpu_rw_lock_v2>) {
         return lk->try_write_lock();
     } else if constexpr (std::is_same_v<L, ticket_lock>) {
         return lk->try_lock();
@@ -77,7 +80,7 @@ static inline bool try_excl(L* lk) {
 
 template <class L>
 static inline bool try_shared(L* lk) {
-    if constexpr (std::is_same_v<L, rw_lock> || std::is_same_v<L, pcpu_rw_lock>) {
+    if constexpr (std::is_same_v<L, rw_lock> || std::is_same_v<L, pcpu_rw_lock> || std::is_same_v<L, pcpu_rw_lock_v2>) {
         return lk->try_read_lock();
     } else {
         return try_excl(lk);  // exclusive-only fallback
@@ -86,14 +89,14 @@ static inline bool try_shared(L* lk) {
 
 template <class L>
 static inline void do_read_lock(L* lk) {
-    if constexpr (std::is_same_v<L, rw_lock> || std::is_same_v<L, pcpu_rw_lock>)
+    if constexpr (std::is_same_v<L, rw_lock> || std::is_same_v<L, pcpu_rw_lock> || std::is_same_v<L, pcpu_rw_lock_v2>)
         lk->read_lock();
     else
         lk->lock();
 }
 template <class L>
 static inline void do_read_unlock(L* lk) {
-    if constexpr (std::is_same_v<L, rw_lock> || std::is_same_v<L, pcpu_rw_lock>)
+    if constexpr (std::is_same_v<L, rw_lock> || std::is_same_v<L, pcpu_rw_lock> || std::is_same_v<L, pcpu_rw_lock_v2>)
         lk->read_unlock();
     else
         lk->unlock();

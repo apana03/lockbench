@@ -120,7 +120,7 @@ set(WH_C_SRCS
 # pcpu-rw is a per-CPU rwlock: reader-scalable in practice (each thread
 # uses its own cache line), unlike `rw` whose CAS-on-shared-counter design
 # matches wormhole's `default` rwlock. See docs/INDEX_LOCK_DECISIONS.md (D9).
-set(WH_LOCKS default rw tas ttas cas occ occ-opt pcpu-rw)
+set(WH_LOCKS default rw tas ttas cas occ occ-opt pcpu-rw pcpu-rw-v2)
 
 foreach(lk IN LISTS WH_LOCKS)
   string(TOUPPER "${lk}" LK_UPPER)
