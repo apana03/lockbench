@@ -1,6 +1,6 @@
 # Investigation — `pcpu_rw_lock` collapse on Graviton2
 
-**Status:** diagnosis confirmed; fix prototype (`pcpu_rw_lock_v2`) implemented and passing correctness; awaiting Graviton validation. ↗ See also `docs/INDEX_LOCK_DECISIONS.md` D9 (introduction of the primitive), the post-implementation findings appended to D22, and D24 (collapse diagnosis).
+**Status:** **complete.** Diagnosis confirmed (thundering herd in the retract-and-spin protocol). Fix prototype `pcpu_rw_lock_v2` validated on Graviton2 — eliminates the collapse: at 8T it delivers 16.0 M ops/s vs v1's 0.03 M ops/s (533× improvement) on the workload that broke v1. v2 now sits in the middle of the lock-comparison ranking, behind `wh-occ-opt` (lock-free reads) but ahead of all spinlock variants. ↗ See also `docs/INDEX_LOCK_DECISIONS.md` D9 (introduction of the primitive), the post-implementation findings appended to D22, and D24 (collapse diagnosis).
 
 This is a running journal. Each section is timestamped; later sections may update or supersede earlier conclusions. Append new findings — don't rewrite old ones.
 
@@ -250,3 +250,63 @@ done
 ```
 
 If the v2 curve climbs through 8T instead of collapsing, the diagnosis-to-fix loop is closed. After that, re-running the full `scripts/wh_compare.sh` will give us comparable cross-arch v1/v2 data for the notebook.
+
+---
+
+## 2026-05-11 — Graviton2 validation of `pcpu_rw_lock_v2` (Option A fix)
+
+Ran the same thread-sweep diagnostic on Graviton2 with v2 alongside v1:
+
+```bash
+for lock in pcpu-rw pcpu-rw-v2; do
+  for t in 1 2 3 4 5 6 8; do
+    for r in 1 2 3; do
+      ./build/wh_bench_$lock --threads $t --seconds 5 --warmup 2 \
+        --dist zipfian --zipf_theta 0.99 --key_range 1000 --prefill 500 \
+        --read_pct 90 --insert_pct 5 --pin_policy compact_phys
+    done
+  done
+done
+```
+
+| threads | v1 median (M ops/s) | v2 median (M ops/s) | v2 / v1 |
+| ---: | ---: | ---: | ---: |
+| 1 | 17.32 | 16.48 | 0.95× |
+| 2 | 17.67 | 21.01 | 1.19× |
+| 3 | 15.90 | 26.46 | 1.66× |
+| 4 | 4.90 | 30.35 | **6.20×** |
+| 5 | 0.41 | 31.60 | **77×** |
+| 6 | 0.18 | 28.84 | **160×** |
+| 8 | 0.030 | 16.00 | **533×** |
+
+**Findings:**
+
+1. **The fix works.** v2 climbs from 1T to a peak at 5T (31.6 M ops/s), 1.92× scaling vs 1T. The collapse mode is eliminated — v2 at 8T is 533× faster than v1, with tight trial-to-trial variance (14.6 / 16.9 / 16.0) instead of v1's 3.5× spread.
+2. **1T cost of v2 vs v1: ~5 % regression** (16.5 vs 17.3 M ops/s). The extra mutex bookkeeping in the fast path (one conditional branch on `writer_pending`) isn't free, but it's the right trade.
+3. **v2 plateaus at 5T and descends through 6T → 8T** (31.6 → 28.8 → 16.0). This is a *new* bottleneck: with 10 % writers and 8 threads competing through `writer_mu`, the mutex itself serialises writers, capping write throughput and indirectly readers in the slow path. Much milder than v1's herd — still 530× faster than v1 at 8T — but worth investigating in a follow-up.
+
+### Where v2 sits in the lock landscape at 8T (Graviton2, L1_warm_read_heavy)
+
+| Lock | 8T M ops/s |
+| --- | ---: |
+| `wh-occ-opt` (lock-free reads) | **69.6** |
+| `wh-default` (counter rwlock)  | 20.3 |
+| **`wh-pcpu-rw-v2`** | **16.0** |
+| `wh-cas`  | 15.5 |
+| `wh-tas`  | 14.2 |
+| `wh-occ`  | 11.0 |
+| `wh-pcpu-rw` (v1) | 0.03 |
+
+v2 lands above the spinlock and OCC-write variants, slightly behind `wh-default`. The thesis story sharpens:
+
+1. The naïve per-CPU rwlock with retract-and-spin **fails catastrophically** under any meaningful writer rate (v1).
+2. Replacing the retract protocol with a mutex-queued slow path **restores usable throughput** (v2), confirming the §6 diagnosis was correct.
+3. But **lock-free OCC reads (`wh-occ-opt`) remain the practical winner** — neither v1 nor v2 catch up. The lesson is that *avoiding the lock altogether* (where the data structure permits) outperforms *fixing* the lock.
+
+→ **Diagnosis → fix → validation loop is closed.** This investigation is complete.
+
+### Follow-ups (not blocking)
+
+- Investigate the v2 6T→8T plateau-then-descent. Hypothesis: `writer_mu` saturation under 10 % writers × 8 threads. Could be tested with a `read_pct=99` sweep on v2 (expect monotonic scaling through 8T if mu is the only bottleneck).
+- Full `wh_compare.sh` run on Graviton2 + Xeon now that `wh-pcpu-rw-v2` is in `LOCKS`. Provides comparable data across the whole 12-workload matrix.
+- Notebook update (`scripts/lockbench_analysis.ipynb`): replace §6 ("anatomy of a thundering herd") interpretation with "the herd, and the fix that demonstrates it was a herd" — using this data as the prosecution AND the resolution.

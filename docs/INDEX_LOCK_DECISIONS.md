@@ -319,3 +319,20 @@ Notebook §6 hypothesised the per-CPU rwlock fails on Graviton2 via a writer-ind
 **Decision:** investigation tracked in `docs/INVESTIGATION_PCPU_RW.md`. Fix candidates: (a) Linux `percpu_rwsem`-style commit-don't-retract protocol (recommended); (b) BRAVO biased rwlock; (c) reader backoff (one-line fallback). Prototype (a) as `pcpu_rw_lock_v2` in a separate primitive so the original measurements stay intact for the comparison.
 
 Not blocking the thesis writeup — the current data is a valid finding ("naïve per-CPU rwlock collapses under contention; per-leaf seqlocks (`wh-occ-opt`) dominate the alternative"). The v2 prototype, if it works, *strengthens* the story rather than replacing it.
+
+## 2026-05-11 — D25: `pcpu_rw_lock_v2` validated; fix loop closed
+
+The `percpu_rwsem`-style fix (D24 Option A) was implemented as `include/primitives/pcpu_rw_lock_v2.hpp` and validated on Graviton2 against v1 on the workload that broke v1 (L1_warm_zipf99 read-heavy 90/5/5):
+
+| threads | v1 median (M/s) | v2 median (M/s) | v2/v1 |
+| ---: | ---: | ---: | ---: |
+| 4 | 4.90 | 30.35 | 6.2× |
+| 8 | 0.03 | 16.00 | **533×** |
+
+v2 scales 1T→5T (16.5 → 31.6 M/s), then plateaus and declines (8T = 16.0 M/s) — a much milder secondary bottleneck (`writer_mu` saturation under 10 % writers × 8 threads), not the thundering-herd catastrophe. Trial variance is gone (8T trials: 14.6 / 16.9 / 16.0, vs v1's 38.6 K / 32.2 K / 11.2 K).
+
+**At 8T on Graviton, v2 sits between `wh-default` and the spinlocks** (16.0 M/s vs default 20.3 M/s vs spinlocks ~14–15 M/s). Lock-free `wh-occ-opt` remains the dominant winner at 69.6 M/s.
+
+The investigation loop (diagnose → hypothesise → fix → validate) is closed. Full record in `docs/INVESTIGATION_PCPU_RW.md`. Thesis story strengthens: "naïve per-CPU rwlock fails catastrophically; the percpu_rwsem-style fix restores it to mid-pack throughput; lock-free OCC reads remain the practical winner for read-heavy concurrent indexes."
+
+Follow-ups (not blocking): full `wh_compare.sh` sweep with v2 across the workload matrix on both arches; notebook §6 update to incorporate the validation data.
