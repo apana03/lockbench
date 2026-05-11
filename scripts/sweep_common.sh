@@ -19,9 +19,10 @@ LB_SWEEP_COMMON_LOADED=1
 
 LB_ARCH="${LB_ARCH:-$(uname -m)}"
 # Same per-trial budget on every arch so wall-clock per data point is comparable
-# across machines. 10 s × 3 repeats with a 2 s warmup amortizes scheduling
-# jitter on Xeon adequately as long as compact_phys pinning is in effect.
-DEFAULT_SECONDS=10
+# across machines. 5 s × 3 repeats with a 2 s warmup is enough post-warmup window
+# to amortize scheduling jitter once compact_phys pinning is in effect; see D23
+# in docs/INDEX_LOCK_DECISIONS.md for the budget rationale.
+DEFAULT_SECONDS=5
 DEFAULT_WARMUP=2
 DEFAULT_REPEATS=3
 
@@ -73,13 +74,17 @@ WORKLOADS=(
   "50 25 zipfian L3_50r_zipf99            --key_range 100000 --zipf_theta 0.99 --prefill 50000"
 )
 
-# Topology-aware thread ladder. Three phases:
+# Topology-aware thread ladder, capped at single-socket physical cores
+# (see D23 in docs/INDEX_LOCK_DECISIONS.md). Phases:
 #   1. Powers of 2 within socket 0's physical-core count (single-socket fill).
-#   2. Total cross-socket physical-core count (NUMA boundary).
-#   3. Total logical-CPU count (SMT engaged).
+#   2. Append socket 0's physical-core count itself (single-socket saturated).
+# Cross-socket (NUMA) and full-machine (SMT) phases are intentionally OMITTED
+# so multi-socket Xeon runs only exercise socket 0 — keeps lock-vs-lock
+# comparisons clean of cross-socket coherence cost. To re-enable, restore the
+# two `[ ... ] && ladder="..."` lines at the end of this function.
 # Falls back to power-of-2 up to nproc when sysfs is unavailable.
 #
-# E.g.: Xeon E5-2650L v3 (12 phys × 2 sock × 2 SMT) → "1 2 4 8 12 24 48"
+# E.g.: Xeon E5-2650L v3 (12 phys × 2 sock × 2 SMT) → "1 2 4 8 12"
 #       Apple M3 (no sysfs)                          → "1 2 4 8 11"
 #       Graviton2 (64 phys × 1 sock × 1 SMT)         → "1 2 4 8 16 32 64"
 compute_thread_ladder() {
@@ -111,8 +116,10 @@ compute_thread_ladder() {
     t=$((t * 2))
   done
   ladder="$ladder $phys_socket0"
-  [ "$n_sockets" -gt 1 ]  && ladder="$ladder $total_phys"
-  [ "$n_logical" -gt "$total_phys" ] && ladder="$ladder $n_logical"
+  # D23: single-socket cap on multi-socket boxes. Cross-socket and SMT phases
+  # are intentionally omitted; uncomment the next two lines to restore them.
+  # [ "$n_sockets" -gt 1 ]  && ladder="$ladder $total_phys"
+  # [ "$n_logical" -gt "$total_phys" ] && ladder="$ladder $n_logical"
   echo "$ladder" | xargs
 }
 

@@ -282,3 +282,27 @@ The flat-region assumption from the initial D22 was wrong on Xeon. Updated frami
 ### CSV columns: `stream_len`, `prefill` now emitted per row
 
 The flat-region check above initially collapsed all 9 trials into one aggregate row because `stream_len` wasn't in the header. Fixed: `print_bench_result` in `include/util/bench_harness.hpp` now emits `stream_len` and `prefill` as additional columns. `scripts/aggregate.py` picks them up automatically because they aren't in `NON_KEY_COLUMNS` (any column not in that set becomes a grouping key). Backward-compat: old CSVs without these columns still aggregate correctly (the DictReader returns empty strings for missing keys, which group together).
+
+## 2026-05-10 — D23: Cut publishable sweep to ≤ 8 h via 12T cap + 5 s × 3
+
+The full publishable sweep across `wh_compare.sh` + `cds_sweep.sh` + `run_avl_compare.sh` was ~20 h on Xeon. User wanted ≤ 8 h budget without losing any of the three benches. Three cuts get to ~6.6 h with margin:
+
+1. **Single-socket cap on the topology ladder.** `compute_thread_ladder` (`scripts/sweep_common.sh`) now omits the cross-socket and full-machine (SMT) phases. On Xeon E5-2650L v3: `1 2 4 8 12 24 48` → `1 2 4 8 12` (5 points). On single-socket ARM (Apple M3, Graviton): unchanged. Saves ~30 % of trials and produces a cleaner lock-vs-lock story — no cross-socket coherence cost confounding the comparison. Reversible by uncommenting the two trailing `[ ... ] && ladder="..."` lines (D17's cross-socket and SMT phases).
+
+2. **`DEFAULT_SECONDS` 10 → 5.** Post-warmup, 5 s is enough for steady-state measurement once compact_phys pinning + 2 s warmup absorb scheduling jitter. 3 repeats × 5 s = 15 s of measurement per cell is plenty for the aggregator's median+IQR. Saves ~40 % of per-trial time.
+
+3. **Drop AVL ↔ StripedMap redundancy** in `run_avl_compare.sh`. Removed the `cdsbench` loop entirely; the script now only runs `cds_avl_bench` (BronsonAVL). `cds_sweep.sh` already produces the StripedMap matrix data at `results/<arch>/cdsbench/cdsbench.csv` — the comparison notebook joins on (lock, dist, threads, workload) keys. Saves ~30 % of `run_avl_compare`'s wall-clock and eliminates duplicated trials.
+
+**Math** (5 s × 3 = 7.5 s/trial, 5-point ladder on Xeon):
+
+| Script | Trials | Wall-clock |
+| --- | ---: | ---: |
+| `wh_compare.sh` (7 × 12 × 5 × 3) | 1,260 | ~2.6 h |
+| `cds_sweep.sh` matrix (5 × 12 × 5 × 3) | 900 | ~1.9 h |
+| `cds_sweep.sh` specials | ~129 | ~16 min |
+| `run_avl_compare.sh` (5 × 12 × 5 × 3, AVL only) | 900 | ~1.9 h |
+| **Total** | **3,189** | **~6.6 h** |
+
+What stays the same: all 12 workloads including θ=1.5 extremes; `compact_phys` pinning; prefill pinned to socket 0; pre-rolled `(key, op)` streams; ARM topology ladders unchanged on Apple M3 / Graviton.
+
+**Trade-off accepted.** Loses NUMA cross-socket coherence data (the 12 → 24 jump) and SMT-contention data (24 → 48) on Xeon. D17's "topology-aware ladder" rationale was to expose those effects; we've decided the cleaner single-socket lock-vs-lock story is more valuable for the thesis question. Both are recoverable by reverting the two-line comment in `compute_thread_ladder`.

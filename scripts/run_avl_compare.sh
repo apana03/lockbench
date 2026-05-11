@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# run_avl_compare.sh — Sweep cdsbench (StripedMap) and cds_avl_bench
-# (BronsonAVL) side-by-side on the shared cache-regime workload matrix.
+# run_avl_compare.sh — Sweep cds_avl_bench (BronsonAVL) on the shared
+# cache-regime workload matrix.
+#
+# StripedMap (cdsbench) data lives in results/<arch>/cdsbench/cdsbench.csv,
+# produced by scripts/cds_sweep.sh — running cdsbench here as well would be
+# duplicated work (same matrix, same locks, same harness). The comparison
+# notebook joins the two CSVs on (lock, dist, threads, workload) keys.
 #
 # Same workloads, same locks (per-bench), same threads, same hygiene as
-# wh_compare.sh and cds_sweep.sh. Designed for the comparison notebook.
+# wh_compare.sh and cds_sweep.sh.
 #
 # Args: ./run_avl_compare.sh [seconds] [warmup] [repeats]
 #       ./run_avl_compare.sh --quick      (5s × 1 repeat for iteration)
@@ -23,21 +28,16 @@ else
 fi
 
 OUT_DIR="${LB_RESULTS:-results/$LB_ARCH}/avl_compare"
-CDS_CSV="$OUT_DIR/cds_striped.csv"
 AVL_CSV="$OUT_DIR/cds_avl.csv"
 
 mkdir -p "$OUT_DIR"
-rm -f "$CDS_CSV" "$AVL_CSV"
+rm -f "$AVL_CSV"
 
 LOCKS="std tas ttas cas ticket"
 
-echo "=== cdsbench (StripedMap) (arch=$LB_ARCH seconds=$SECONDS_PER_RUN warmup=$WARMUP repeats=$REPEATS) ==="
-for lock in $LOCKS; do
-  run_workload_matrix_on ./build/cdsbench "$CDS_CSV" --lock "$lock"
-done
-
-echo "=== cds_avl_bench (BronsonAVL) ==="
+echo "=== cds_avl_bench (BronsonAVL) (arch=$LB_ARCH seconds=$SECONDS_PER_RUN warmup=$WARMUP repeats=$REPEATS) ==="
 for lock in $LOCKS; do
   run_workload_matrix_on ./build/cds_avl_bench "$AVL_CSV" --lock "$lock"
 done
-echo "Done. CSVs in $OUT_DIR"
+echo "Done. CSV in $AVL_CSV"
+echo "(StripedMap data: run scripts/cds_sweep.sh — output at results/$LB_ARCH/cdsbench/cdsbench.csv)"
