@@ -306,3 +306,16 @@ The full publishable sweep across `wh_compare.sh` + `cds_sweep.sh` + `run_avl_co
 What stays the same: all 12 workloads including θ=1.5 extremes; `compact_phys` pinning; prefill pinned to socket 0; pre-rolled `(key, op)` streams; ARM topology ladders unchanged on Apple M3 / Graviton.
 
 **Trade-off accepted.** Loses NUMA cross-socket coherence data (the 12 → 24 jump) and SMT-contention data (24 → 48) on Xeon. D17's "topology-aware ladder" rationale was to expose those effects; we've decided the cleaner single-socket lock-vs-lock story is more valuable for the thesis question. Both are recoverable by reverting the two-line comment in `compute_thread_ladder`.
+
+## 2026-05-11 — D24: `pcpu_rw_lock` collapse — diagnosis confirmed (thundering herd)
+
+Notebook §6 hypothesised the per-CPU rwlock fails on Graviton2 via a writer-induced reader retract storm. A targeted thread-sweep + read-percentage sweep on Graviton2 confirmed this conclusively:
+
+- **Thread sweep at 90/5/5:** smooth feedback degradation 1T→6T (17.3 → 0.15 M ops/s), with trial-to-trial variance growing monotonically. **Not** a discrete cliff.
+- **Read-percentage sweep at 4T:** at 100/0/0 the lock scales super-linearly to 75.6 M ops/s (4.37×). One percent writers (99/0/1) immediately costs 43 % of throughput; 5 % writers cost 94 %.
+
+**Verdict:** the per-CPU slot infrastructure is sound (super-linear read scaling proves no reader contention). The retract-and-spin reader protocol is the bug — any non-trivial writer rate triggers the herd.
+
+**Decision:** investigation tracked in `docs/INVESTIGATION_PCPU_RW.md`. Fix candidates: (a) Linux `percpu_rwsem`-style commit-don't-retract protocol (recommended); (b) BRAVO biased rwlock; (c) reader backoff (one-line fallback). Prototype (a) as `pcpu_rw_lock_v2` in a separate primitive so the original measurements stay intact for the comparison.
+
+Not blocking the thesis writeup — the current data is a valid finding ("naïve per-CPU rwlock collapses under contention; per-leaf seqlocks (`wh-occ-opt`) dominate the alternative"). The v2 prototype, if it works, *strengthens* the story rather than replacing it.
