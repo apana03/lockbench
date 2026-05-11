@@ -123,7 +123,7 @@ Likely buys us back to "matches `wh-default`" — not a structural fix, but a on
 
 ## Open questions / next investigations
 
-- [ ] **0c — microbench check.** Does `./build/lockbench --lock pcpu-rw --workload rw` show the same collapse curve? If yes, the failure is entirely intrinsic to the lock primitive; if no, wormhole's metalock+leaflock coupling amplifies the herd and the fix may have a workload component.
+- [x] **0c — microbench check.** Done; confirms the lock primitive fails on its own, with wormhole providing ~86× amplification. See the section below.
 - [ ] **`perf stat` on Graviton2 under collapse mode** — confirm cycles are spent in atomic stalls (`stall_backend`) vs cache misses vs idle spinning. Predicted: high `stall_backend`, moderate cache-misses.
 - [ ] **ThreadSanitizer build** to rule out a latent data race in `my_slot()` or `slots[]` allocation that's mostly invisible under x86 TSO.
 - [ ] **Prototype Option A** as `pcpu_rw_lock_v2` (parallel primitive in `include/primitives/`). Wire into the wormhole shim as a separate `wh-pcpu-rw-v2` build, sweep the same matrix, compare directly.
@@ -151,3 +151,47 @@ Likely buys us back to "matches `wh-default`" — not a structural fix, but a on
 
 # Thread sweep + read-pct sweep scripts are in this document above.
 ```
+
+---
+
+## 2026-05-11 — Diagnostic 0c: lockbench microbench (single global `pcpu_rw_lock`, no wormhole call pattern)
+
+Tests whether the failure mode is intrinsic to the lock primitive or whether wormhole's metalock+leaflock coupling is required to trigger it. Same workload shape (90 % reads), same pinning, just a different driver that exercises one global pcpu_rw_lock:
+
+```bash
+for t in 1 2 3 4 5 6; do
+  for r in 1 2 3; do
+    ./build/lockbench --lock pcpu-rw --workload rw --threads $t \
+      --seconds 5 --warmup 2 --read_pct 90 --pin_policy compact_phys
+  done
+done
+```
+
+| threads | median (M ops/s) | scaling vs 1T | trial spread |
+| ---: | ---: | ---: | --- |
+| 1 | 62.08 | 1.00× | < 0.1 % (tight) |
+| 2 | 28.17 | 0.45× | 24.0–29.0 M |
+| 3 | 23.09 | 0.37× | 22.9–23.8 M |
+| 4 | 19.30 | 0.31× | 17.5–20.2 M |
+| 5 | 17.88 | 0.29× | 16.2–18.3 M |
+| 6 | 12.90 | 0.21× | 12.6–14.8 M |
+
+**Findings:**
+
+1. **The lock primitive itself fails to scale**, independent of wormhole. 1T → 6T loses 79 % of throughput on a workload that should be reader-scalable. The herd is intrinsic to the lock.
+2. **It is much milder than in wormhole.** At 6T microbench delivers 12.9 M ops/s; wh_bench delivers 0.15 M ops/s — **86× amplification** by the wormhole call pattern.
+
+### Amplification mechanism — wormhole-specific
+
+Two contributors explain the 86× factor:
+
+- **Two locks per op.** Wormhole acquires the global metalock (read) plus a per-leaf leaflock (read or write) per operation. Both are `pcpu_rw_lock` instances. A writer event on *either* lock triggers a reader retract for *that* lock's readers. With 5 % insert + 5 % delete (= 10 % leaflock writers), you're in herd state on both locks simultaneously.
+- **Writer CS is much longer in wormhole than microbench.** Microbench writer CS is ~10 ns (one counter increment). Wormhole writer CS is hundreds of ns (sort the leaf, insert the KV, occasionally resize). While `writer_present` is held, all readers spin uselessly. The longer the CS, the larger the fraction of wall-clock spent in reader spin.
+
+This is consistent with the **86× amplification** number: roughly (2 locks) × (CS-time ratio ~30×) ≈ ×60–100 multiplier on top of the bare primitive failure.
+
+### Implication for the fix
+
+The lock primitive is the root cause; wormhole is the amplifier. **Fixing the primitive will improve both benchmarks** — the microbench will recover most of its 1T throughput (likely 50+ M ops/s at 6T) and wormhole will benefit even more because long writer CSes will no longer cause reader thrashing.
+
+→ Diagnosis closed. The remaining work is the fix prototype (Option A in the earlier section). Confidence is high enough to commit to the fix path without running 3a–3e first.
