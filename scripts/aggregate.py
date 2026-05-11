@@ -23,6 +23,7 @@ import math
 import statistics
 import sys
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 
 # Columns that are NOT grouping keys (they are the per-trial metrics or labels).
@@ -38,7 +39,7 @@ NON_KEY_COLUMNS = {
 METRICS = ["ops_s", "ns_op", "fairness_ratio"]
 
 
-def parse_num(s: str) -> float | None:
+def parse_num(s: str) -> Optional[float]:
     """Parse a number that may use ',' as the decimal separator. Returns None on fail."""
     if s is None or s == "":
         return None
@@ -48,7 +49,7 @@ def parse_num(s: str) -> float | None:
         return None
 
 
-def fmt_num(v: float | None) -> str:
+def fmt_num(v: Optional[float]) -> str:
     if v is None:
         return ""
     if math.isnan(v):
@@ -56,7 +57,7 @@ def fmt_num(v: float | None) -> str:
     return f"{v:.6g}".replace(".", ",")
 
 
-def cov_pct(values: list[float]) -> float | None:
+def cov_pct(values: List[float]) -> Optional[float]:
     """Coefficient of variation (stddev / mean) as a percentage. None if undefined."""
     if len(values) < 2:
         return None
@@ -87,7 +88,7 @@ def aggregate(input_path: Path, output_path: Path, cov_warn: float) -> int:
         print(f"error: no aggregatable metric column found (looked for {METRICS})", file=sys.stderr)
         return 2
 
-    groups: dict[tuple, list[dict]] = {}
+    groups: Dict[Tuple, List[Dict]] = {}
     for row in rows:
         key = tuple(row.get(c, "") for c in key_cols)
         groups.setdefault(key, []).append(row)
